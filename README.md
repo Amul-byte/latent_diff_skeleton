@@ -4,7 +4,7 @@ This repository implements a 3-stage Joint-Aware Latent Diffusion framework:
 
 1. Stage 1: Skeleton latent diffusion pretraining.
 2. Stage 2: IMU-to-latent regression with frozen Stage 1 encoder.
-3. Stage 3: Conditional diffusion, decoding, and skeleton classification.
+3. Stage 3: Conditional diffusion, decoding, and skeleton classification..
 
 ## Training
 
