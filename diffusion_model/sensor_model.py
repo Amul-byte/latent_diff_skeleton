@@ -52,7 +52,7 @@ class SensorTGNNEncoder(nn.Module):
 
     Input:
         - ``hip_accel``: [B, T, 3]
-        - ``wrist_gyro``: [B, T, 3]
+        - ``wrist_accel``: [B, T, 3]
 
     Output:
         - ``h_joint``: [B, T, J, D] (latent aligned with Stage 1 ``z0``)
@@ -88,25 +88,25 @@ class SensorTGNNEncoder(nn.Module):
         self.sequence_norm = nn.LayerNorm(latent_dim)
         self.joint_tokens = nn.Parameter(torch.randn(1, 1, num_joints, latent_dim) * 0.02)
 
-    def forward(self, hip_accel: torch.Tensor, wrist_gyro: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hip_accel: torch.Tensor, wrist_accel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode hip and wrist IMU streams.
 
         Args:
             hip_accel: Hip accelerometer stream [B, T, 3].
-            wrist_gyro: Wrist gyroscope stream [B, T, 3].
+            wrist_accel: Wrist accelerometer stream [B, T, 3].
 
         Returns:
             Tuple of ``h_joint`` [B, T, J, D] and ``h_seq`` [B, T, D].
         """
         assert_rank(hip_accel, 3, "hip_accel")
-        assert_rank(wrist_gyro, 3, "wrist_gyro")
+        assert_rank(wrist_accel, 3, "wrist_accel")
         assert_last_dim(hip_accel, 3, "hip_accel")
-        assert_last_dim(wrist_gyro, 3, "wrist_gyro")
-        if hip_accel.shape[:2] != wrist_gyro.shape[:2]:
-            raise AssertionError("hip_accel and wrist_gyro must match on [B, T]")
+        assert_last_dim(wrist_accel, 3, "wrist_accel")
+        if hip_accel.shape[:2] != wrist_accel.shape[:2]:
+            raise AssertionError("hip_accel and wrist_accel must match on [B, T]")
 
         hip_features = self.hip_branch(hip_accel)
-        wrist_features = self.wrist_branch(wrist_gyro)
+        wrist_features = self.wrist_branch(wrist_accel)
         fused = torch.cat([hip_features, wrist_features], dim=-1)
 
         h_seq = self.sequence_norm(self.fusion(fused))

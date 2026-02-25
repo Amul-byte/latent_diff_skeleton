@@ -1,6 +1,6 @@
 """Joint-Aware Latent Diffusion package modules."""
 
-from diffusion_model.dataset import IMUDataset, PairedDataset, SkeletonDataset, ToyConfig
+from diffusion_model.dataset import IMUDataset, NormalizationConfig, PairedDataset, SkeletonDataset
 from diffusion_model.diffusion import LatentDiffusion, linear_beta_schedule
 from diffusion_model.graph_modules import GraphDecoder, GraphDenoiserMasked, GraphEncoder
 from diffusion_model.model import Stage3Model, TransformerClassifier
@@ -21,7 +21,7 @@ __all__ = [
     "SkeletonDataset",
     "IMUDataset",
     "PairedDataset",
-    "ToyConfig",
+    "NormalizationConfig",
     "load_checkpoint",
     "freeze_module",
     "verify_frozen",

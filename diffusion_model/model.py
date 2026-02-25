@@ -235,7 +235,7 @@ class Stage3Model(nn.Module):
             Sampled latent tensor [B, T, J, D].
         """
         shape = (batch_size, window, self.num_joints, self.latent_dim)
-        return self.diffusion.p_sample_loop(
+        return self.diffusion.sample(
             denoiser=self.denoiser,
             shape=shape,
             device=device,

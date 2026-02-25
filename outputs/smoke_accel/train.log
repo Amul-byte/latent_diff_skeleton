@@ -1,0 +1,10 @@
+2026-02-25 20:38:10,434 | INFO | train | Running stage 2 on device=cuda
+2026-02-25 20:38:11,010 | INFO | train | Loaded Stage 1 checkpoint from checkpoints/smoke_stage1.pt
+2026-02-25 20:38:11,886 | INFO | train | stage=2 epoch=0 step=1 reg_loss=1.142013
+2026-02-25 20:38:11,894 | INFO | train | Saved Stage 2 checkpoint to checkpoints/smoke_stage2_accel_only.pt
+2026-02-25 20:38:37,391 | INFO | train | Running stage 3 on device=cuda
+2026-02-25 20:38:37,819 | INFO | train | Loaded Stage 1 checkpoint from checkpoints/smoke_stage1.pt
+2026-02-25 20:38:37,831 | INFO | train | Loaded Stage 2 checkpoint from checkpoints/smoke_stage2_accel_only.pt
+2026-02-25 20:38:38,626 | INFO | train | stage=3 unconditional conditioning check passed diff=1.233689
+2026-02-25 20:38:38,831 | INFO | train | stage=3 epoch=0 step=1 loss=3.280433 diff=1.160897 cls=2.119536
+2026-02-25 20:38:38,874 | INFO | train | Saved Stage 3 checkpoint to checkpoints/smoke_stage3_accel_only.pt

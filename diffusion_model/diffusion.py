@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Dict, Optional
 
 import torch
@@ -66,6 +67,30 @@ class LatentDiffusion(nn.Module):
 
         posterior_variance = betas * (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod)
         self.register_buffer("posterior_variance", posterior_variance.clamp(1e-12, 1.0))
+
+    @staticmethod
+    def _validate_denoiser_accepts_timestep(denoiser: nn.Module) -> None:
+        """Ensure denoiser forward explicitly accepts timestep input ``t``."""
+        try:
+            signature = inspect.signature(denoiser.forward)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("Unable to inspect denoiser.forward signature") from exc
+
+        params = signature.parameters
+        if "t" not in params:
+            raise TypeError("denoiser.forward must define a timestep argument named 't'")
+
+    def _call_denoiser(
+        self,
+        denoiser: nn.Module,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        adjacency: torch.Tensor,
+        h: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Call denoiser with strict timestep-aware interface validation."""
+        self._validate_denoiser_accepts_timestep(denoiser)
+        return denoiser(z_t=z_t, t=t, adjacency=adjacency, h=h)
 
     @staticmethod
     def _extract(coeff: torch.Tensor, t: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
@@ -175,7 +200,7 @@ class LatentDiffusion(nn.Module):
             noise = torch.randn_like(z0)
 
         z_t = self.q_sample(z0=z0, t=t, noise=noise)
-        noise_hat = denoiser(z_t=z_t, t=t, adjacency=adjacency, h=h)
+        noise_hat = self._call_denoiser(denoiser=denoiser, z_t=z_t, t=t, adjacency=adjacency, h=h)
         if noise_hat.shape != noise.shape:
             raise AssertionError("noise prediction must match noise shape")
 
@@ -203,7 +228,7 @@ class LatentDiffusion(nn.Module):
         Returns:
             Previous latent sample ``z_{t-1}``.
         """
-        noise_hat = denoiser(z_t=z_t, t=t, adjacency=adjacency, h=h)
+        noise_hat = self._call_denoiser(denoiser=denoiser, z_t=z_t, t=t, adjacency=adjacency, h=h)
         beta_t = self._extract(self.betas, t, z_t.shape)
         sqrt_one_minus_alpha_t = self._extract(self.sqrt_one_minus_alpha_cumprod, t, z_t.shape)
         sqrt_recip_alpha_t = self._extract(self.sqrt_recip_alpha, t, z_t.shape)
@@ -249,3 +274,23 @@ class LatentDiffusion(nn.Module):
             t = torch.full((shape[0],), step, device=device, dtype=torch.long)
             z_t = self.p_sample(denoiser=denoiser, z_t=z_t, t=t, adjacency=adjacency, h=h)
         return z_t
+
+    @torch.no_grad()
+    def sample(
+        self,
+        denoiser: nn.Module,
+        shape: tuple[int, int, int, int],
+        device: torch.device,
+        adjacency: torch.Tensor,
+        h: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Public reverse-diffusion sampling API."""
+        return self.p_sample_loop(
+            denoiser=denoiser,
+            shape=shape,
+            device=device,
+            adjacency=adjacency,
+            h=h,
+            steps=steps,
+        )

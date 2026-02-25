@@ -11,12 +11,14 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from diffusion_model.dataset import PairedDataset, SkeletonDataset, ToyConfig
+from diffusion_model.dataset import NormalizationConfig, PairedDataset, SkeletonDataset
 from diffusion_model.model import Stage3Model
 from diffusion_model.model_loader import freeze_module, load_checkpoint, verify_frozen
 from diffusion_model.sensor_model import SensorTGNNEncoder
 from diffusion_model.skeleton_model import SkeletonStage1Model
 from diffusion_model.util import build_chain_adjacency, ensure_dir, get_logger, resolve_device, set_seed
+
+ACCEL_SENSORS = ["meta_hip", "meta_wrist", "phone", "watch"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +37,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--stage1-phase",
+        type=str,
+        default="ae",
+        choices=["ae", "diff", "diffusion_uncond"],
+        help="Stage-1 phase: AE pretrain or unconditional diffusion pretrain",
+    )
 
     parser.add_argument("--diffusion-steps", type=int, default=500)
     parser.add_argument("--latent-dim", type=int, default=256)
@@ -49,6 +58,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=128)
     parser.add_argument("--paired-file", type=str, default=None, help="Optional .pt file with paired tensors")
     parser.add_argument("--skeleton-file", type=str, default=None, help="Optional .pt file with skeleton tensors")
+    parser.add_argument(
+        "--sensor-a",
+        type=str,
+        default="meta_hip",
+        choices=ACCEL_SENSORS,
+        help="Primary acceleration sensor name",
+    )
+    parser.add_argument(
+        "--sensor-b",
+        type=str,
+        default="meta_wrist",
+        choices=ACCEL_SENSORS,
+        help="Secondary acceleration sensor name",
+    )
+    parser.add_argument(
+        "--accel-normalization",
+        type=str,
+        default="zscore",
+        choices=["zscore", "none"],
+        help="Acceleration normalization mode",
+    )
 
     parser.add_argument("--stage1-ckpt", type=str, default="checkpoints/stage1.pt")
     parser.add_argument("--stage2-ckpt", type=str, default="checkpoints/stage2.pt")
@@ -81,8 +111,43 @@ def _load_tensor_payload(path: str) -> Dict[str, torch.Tensor]:
     return payload
 
 
+def _resolve_accel_pair_from_payload(
+    payload: Dict[str, torch.Tensor],
+    sensor_a: str,
+    sensor_b: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve two acceleration tensors from a data payload.
+
+    Args:
+        payload: Dictionary loaded from paired data file.
+        sensor_a: Primary sensor name.
+        sensor_b: Secondary sensor name.
+
+    Returns:
+        Tuple of acceleration tensors ``(A1, A2)``, each with shape ``[N, T, 3]``.
+    """
+    accel_by_sensor = payload.get("accel_by_sensor")
+    if isinstance(accel_by_sensor, dict):
+        if sensor_a not in accel_by_sensor:
+            raise KeyError(f"Sensor '{sensor_a}' missing from accel_by_sensor")
+        if sensor_b not in accel_by_sensor:
+            raise KeyError(f"Sensor '{sensor_b}' missing from accel_by_sensor")
+        return accel_by_sensor[sensor_a], accel_by_sensor[sensor_b]
+
+    if "A1" in payload and "A2" in payload:
+        return payload["A1"], payload["A2"]
+
+    if "A_pair" in payload:
+        accel_pair = payload["A_pair"]
+        if accel_pair.ndim != 4 or accel_pair.shape[1] != 2 or accel_pair.shape[-1] != 3:
+            raise ValueError("A_pair must have shape [N, 2, T, 3]")
+        return accel_pair[:, 0], accel_pair[:, 1]
+
+    raise KeyError("Unable to resolve two acceleration streams from paired payload")
+
+
 def build_stage1_loader(args: argparse.Namespace) -> DataLoader:
-    """Create Stage 1 dataloader using real or toy skeleton data.
+    """Create Stage 1 dataloader using real skeleton data.
 
     Args:
         args: Parsed CLI arguments.
@@ -90,29 +155,20 @@ def build_stage1_loader(args: argparse.Namespace) -> DataLoader:
     Returns:
         DataLoader for Stage 1.
     """
-    if args.skeleton_file is not None and Path(args.skeleton_file).exists():
-        payload = _load_tensor_payload(args.skeleton_file)
-        dataset = SkeletonDataset(
-            skeleton=payload.get("X"),
-            labels=payload.get("y"),
-            toy=False,
-        )
-    else:
-        toy = ToyConfig(
-            num_samples=args.num_samples,
-            window=args.window,
-            joints=args.joints,
-            joint_dim=args.joint_dim,
-            num_classes=args.num_classes,
-            seed=args.seed,
-        )
-        dataset = SkeletonDataset(toy=True, toy_config=toy)
+    if args.skeleton_file is None or not Path(args.skeleton_file).exists():
+        raise FileNotFoundError("Stage 1 requires --skeleton-file pointing to an existing .pt file")
+
+    payload = _load_tensor_payload(args.skeleton_file)
+    dataset = SkeletonDataset(
+        skeleton=payload.get("X"),
+        labels=payload.get("y"),
+    )
 
     return DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=0)
 
 
 def build_paired_loader(args: argparse.Namespace) -> DataLoader:
-    """Create paired dataloader for Stage 2/3 using real or toy data.
+    """Create paired dataloader for Stage 2/3 using real data.
 
     Args:
         args: Parsed CLI arguments.
@@ -120,25 +176,26 @@ def build_paired_loader(args: argparse.Namespace) -> DataLoader:
     Returns:
         Paired DataLoader.
     """
-    if args.paired_file is not None and Path(args.paired_file).exists():
-        payload = _load_tensor_payload(args.paired_file)
-        dataset = PairedDataset(
-            skeleton=payload.get("X"),
-            accel=payload.get("A"),
-            gyro=payload.get("Omega"),
-            labels=payload.get("y"),
-            toy=False,
-        )
-    else:
-        toy = ToyConfig(
-            num_samples=args.num_samples,
-            window=args.window,
-            joints=args.joints,
-            joint_dim=args.joint_dim,
-            num_classes=args.num_classes,
-            seed=args.seed,
-        )
-        dataset = PairedDataset(toy=True, toy_config=toy)
+    normalization = NormalizationConfig(mode=args.accel_normalization)
+    sensor_pair = (args.sensor_a, args.sensor_b)
+
+    if args.paired_file is None or not Path(args.paired_file).exists():
+        raise FileNotFoundError("Stage 2/3 requires --paired-file pointing to an existing .pt file")
+
+    payload = _load_tensor_payload(args.paired_file)
+    accel_primary, accel_secondary = _resolve_accel_pair_from_payload(
+        payload=payload,
+        sensor_a=args.sensor_a,
+        sensor_b=args.sensor_b,
+    )
+    dataset = PairedDataset(
+        skeleton=payload.get("X"),
+        accel_primary=accel_primary,
+        accel_secondary=accel_secondary,
+        labels=payload.get("y"),
+        sensor_pair=sensor_pair,
+        normalization=normalization,
+    )
 
     return DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=0)
 
@@ -164,7 +221,21 @@ def train_stage1(args: argparse.Namespace, device: torch.device, logger: logging
         use_torch_geometric=args.use_torch_geometric,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    stage1_mode = "diff" if args.stage1_phase == "diffusion_uncond" else args.stage1_phase
+
+    if stage1_mode == "ae":
+        freeze_module(model.denoiser)
+        verify_frozen(model.denoiser)
+    elif stage1_mode == "diff":
+        freeze_module(model.encoder)
+        freeze_module(model.decoder)
+        verify_frozen(model.encoder)
+        verify_frozen(model.decoder)
+
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_params:
+        raise RuntimeError(f"No trainable parameters found for stage1 mode '{stage1_mode}'")
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     model.train()
     global_step = 0
@@ -174,6 +245,7 @@ def train_stage1(args: argparse.Namespace, device: torch.device, logger: logging
             out = model.forward_stage1(
                 x=x,
                 adjacency=adjacency,
+                mode=stage1_mode,
                 recon_weight=args.recon_weight,
                 diffusion_weight=args.diffusion_weight,
             )
@@ -278,13 +350,13 @@ def train_stage2(args: argparse.Namespace, device: torch.device, logger: logging
     for epoch in range(args.epochs):
         for batch in loader:
             x = batch["X"].to(device)
-            accel = batch["A"].to(device)
-            gyro = batch["Omega"].to(device)
+            accel_primary = batch["A1"].to(device)
+            accel_secondary = batch["A2"].to(device)
 
             with torch.no_grad():
                 z0_target = stage1_model.encoder(x, adjacency)
 
-            h_joint, _ = sensor_model(accel, gyro)
+            h_joint, _ = sensor_model(accel_primary, accel_secondary)
             if h_joint.shape != z0_target.shape:
                 raise AssertionError("Stage 2 target and prediction shapes must match")
 
@@ -392,13 +464,13 @@ def train_stage3(args: argparse.Namespace, device: torch.device, logger: logging
     for epoch in range(args.epochs):
         for batch in loader:
             x = batch["X"].to(device)
-            accel = batch["A"].to(device)
-            gyro = batch["Omega"].to(device)
+            accel_primary = batch["A1"].to(device)
+            accel_secondary = batch["A2"].to(device)
             labels = batch["y"].to(device)
 
             with torch.no_grad():
                 z0_target = stage1_model.encoder(x, adjacency)
-                h_joint, _ = sensor_model(accel, gyro)
+                h_joint, _ = sensor_model(accel_primary, accel_secondary)
 
             if not unconditional_checked:
                 with torch.no_grad():

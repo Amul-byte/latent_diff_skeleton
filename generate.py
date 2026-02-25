@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Dict
 
 import torch
 from torch.utils.data import DataLoader
 
-from diffusion_model.dataset import IMUDataset, ToyConfig
+from diffusion_model.dataset import IMUDataset, NormalizationConfig
 from diffusion_model.model import Stage3Model
 from diffusion_model.model_loader import freeze_module, load_checkpoint, verify_frozen
 from diffusion_model.sensor_model import SensorTGNNEncoder
 from diffusion_model.skeleton_model import SkeletonStage1Model
 from diffusion_model.util import build_chain_adjacency, resolve_device, set_seed
+
+ACCEL_SENSORS = ["meta_hip", "meta_wrist", "phone", "watch"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +32,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--paired-file", type=str, default=None, help="Required .pt file with paired tensors")
+    parser.add_argument("--sensor-a", type=str, default="meta_hip", choices=ACCEL_SENSORS)
+    parser.add_argument("--sensor-b", type=str, default="meta_wrist", choices=ACCEL_SENSORS)
+    parser.add_argument("--accel-normalization", type=str, default="zscore", choices=["zscore", "none"])
     parser.add_argument("--window", type=int, default=90)
     parser.add_argument("--joints", type=int, default=32)
     parser.add_argument("--joint-dim", type=int, default=3)
@@ -46,6 +53,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-torch-geometric", action="store_true")
     parser.add_argument("--output", type=str, default="outputs/generated.pt")
     return parser.parse_args()
+
+
+def _load_tensor_payload(path: str) -> Dict[str, torch.Tensor]:
+    """Load tensor payload from a `.pt` file."""
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Expected dictionary payload in data file")
+    return payload
+
+
+def _resolve_accel_pair_from_payload(
+    payload: Dict[str, torch.Tensor],
+    sensor_a: str,
+    sensor_b: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve two acceleration tensors from a data payload."""
+    accel_by_sensor = payload.get("accel_by_sensor")
+    if isinstance(accel_by_sensor, dict):
+        if sensor_a not in accel_by_sensor:
+            raise KeyError(f"Sensor '{sensor_a}' missing from accel_by_sensor")
+        if sensor_b not in accel_by_sensor:
+            raise KeyError(f"Sensor '{sensor_b}' missing from accel_by_sensor")
+        return accel_by_sensor[sensor_a], accel_by_sensor[sensor_b]
+
+    if "A1" in payload and "A2" in payload:
+        return payload["A1"], payload["A2"]
+
+    if "A_pair" in payload:
+        accel_pair = payload["A_pair"]
+        if accel_pair.ndim != 4 or accel_pair.shape[1] != 2 or accel_pair.shape[-1] != 3:
+            raise ValueError("A_pair must have shape [N, 2, T, 3]")
+        return accel_pair[:, 0], accel_pair[:, 1]
+
+    raise KeyError("Unable to resolve two acceleration streams from paired payload")
 
 
 def _load_stage1_model(args: argparse.Namespace, device: torch.device) -> SkeletonStage1Model:
@@ -160,26 +201,32 @@ def main() -> None:
     sensor_model = _load_stage2_sensor(args, device)
     stage3_model = _build_stage3_sampler(args, stage1_model, device)
 
-    toy = ToyConfig(
-        num_samples=max(args.num_samples, args.batch_size),
-        window=args.window,
-        joints=args.joints,
-        joint_dim=args.joint_dim,
-        num_classes=args.num_classes,
-        seed=args.seed,
+    if args.paired_file is None or not Path(args.paired_file).exists():
+        raise FileNotFoundError("Generation requires --paired-file pointing to an existing .pt file")
+    payload = _load_tensor_payload(args.paired_file)
+    accel_primary, accel_secondary = _resolve_accel_pair_from_payload(
+        payload=payload,
+        sensor_a=args.sensor_a,
+        sensor_b=args.sensor_b,
     )
-    imu_dataset = IMUDataset(toy=True, toy_config=toy)
+    imu_dataset = IMUDataset(
+        accel_primary=accel_primary,
+        accel_secondary=accel_secondary,
+        labels=payload.get("y"),
+        sensor_pair=(args.sensor_a, args.sensor_b),
+        normalization=NormalizationConfig(mode=args.accel_normalization),
+    )
     loader = DataLoader(imu_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     batch = next(iter(loader))
 
-    accel = batch["A"].to(device)
-    gyro = batch["Omega"].to(device)
-    batch_size = accel.shape[0]
+    accel_primary = batch["A1"].to(device)
+    accel_secondary = batch["A2"].to(device)
+    batch_size = accel_primary.shape[0]
 
     adjacency = build_chain_adjacency(args.joints, include_self=True, device=device)
 
     with torch.no_grad():
-        h_joint, _ = sensor_model(accel, gyro)
+        h_joint, _ = sensor_model(accel_primary, accel_secondary)
         z0 = stage3_model.sample_conditional(
             batch_size=batch_size,
             window=args.window,
