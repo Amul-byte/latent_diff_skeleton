@@ -2,7 +2,6 @@
 
 This module supports two acceleration sensors (for example: ``meta_hip`` +
 ``meta_wrist`` or ``phone`` + ``watch``) and applies per-sensor normalization.
-Gyroscope streams are intentionally removed.
 """
 
 from __future__ import annotations

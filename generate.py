@@ -202,7 +202,7 @@ def main() -> None:
     stage3_model = _build_stage3_sampler(args, stage1_model, device)
 
     if args.paired_file is None or not Path(args.paired_file).exists():
-        raise FileNotFoundError("Generation requires --paired-file pointing to an existing .pt file")
+        raise FileNotFoundError("Generation requires --paired-file pointing to a valid .pt file")
     payload = _load_tensor_payload(args.paired_file)
     accel_primary, accel_secondary = _resolve_accel_pair_from_payload(
         payload=payload,

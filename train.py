@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--stage1-phase",
         type=str,
         default="ae",
-        choices=["ae", "diff", "diffusion_uncond"],
+        choices=["ae", "diff", "ae_then_diff"],
         help="Stage-1 phase: AE pretrain or unconditional diffusion pretrain",
     )
 
@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--use-torch-geometric", action="store_true")
+    parser.add_argument("--finetune-decoder", action="store_true")
     parser.add_argument("--output-dir", type=str, default="outputs")
     return parser.parse_args()
 
@@ -156,7 +157,9 @@ def build_stage1_loader(args: argparse.Namespace) -> DataLoader:
         DataLoader for Stage 1.
     """
     if args.skeleton_file is None or not Path(args.skeleton_file).exists():
-        raise FileNotFoundError("Stage 1 requires --skeleton-file pointing to an existing .pt file")
+        raise FileNotFoundError(
+            "Stage 1 requires --skeleton-file pointing to a valid .pt file containing 'X' and optional 'y'"
+        )
 
     payload = _load_tensor_payload(args.skeleton_file)
     dataset = SkeletonDataset(
@@ -180,7 +183,7 @@ def build_paired_loader(args: argparse.Namespace) -> DataLoader:
     sensor_pair = (args.sensor_a, args.sensor_b)
 
     if args.paired_file is None or not Path(args.paired_file).exists():
-        raise FileNotFoundError("Stage 2/3 requires --paired-file pointing to an existing .pt file")
+        raise FileNotFoundError("Stage 2/3 requires --paired-file pointing to a valid .pt file")
 
     payload = _load_tensor_payload(args.paired_file)
     accel_primary, accel_secondary = _resolve_accel_pair_from_payload(
@@ -221,56 +224,81 @@ def train_stage1(args: argparse.Namespace, device: torch.device, logger: logging
         use_torch_geometric=args.use_torch_geometric,
     ).to(device)
 
-    stage1_mode = "diff" if args.stage1_phase == "diffusion_uncond" else args.stage1_phase
+    def _set_trainable(module: torch.nn.Module, value: bool) -> None:
+        for parameter in module.parameters():
+            parameter.requires_grad = value
+        if value:
+            module.train()
+        else:
+            module.eval()
 
-    if stage1_mode == "ae":
-        freeze_module(model.denoiser)
-        verify_frozen(model.denoiser)
-    elif stage1_mode == "diff":
-        freeze_module(model.encoder)
-        freeze_module(model.decoder)
-        verify_frozen(model.encoder)
-        verify_frozen(model.decoder)
+    phase_sequence = ["ae", "diff"] if args.stage1_phase == "ae_then_diff" else [args.stage1_phase]
+    optimizer: Optional[torch.optim.Optimizer] = None
 
-    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable_params:
-        raise RuntimeError(f"No trainable parameters found for stage1 mode '{stage1_mode}'")
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    for phase in phase_sequence:
+        if phase == "ae":
+            _set_trainable(model.encoder, True)
+            _set_trainable(model.decoder, True)
+            freeze_module(model.denoiser)
+            verify_frozen(model.denoiser)
+        elif phase == "diff":
+            freeze_module(model.encoder)
+            freeze_module(model.decoder)
+            verify_frozen(model.encoder)
+            verify_frozen(model.decoder)
+            _set_trainable(model.denoiser, True)
+        else:
+            raise ValueError(f"Unsupported stage1 phase: {phase}")
 
-    model.train()
-    global_step = 0
-    for epoch in range(args.epochs):
-        for batch in loader:
-            x = batch["X"].to(device)
-            out = model.forward_stage1(
-                x=x,
-                adjacency=adjacency,
-                mode=stage1_mode,
-                recon_weight=args.recon_weight,
-                diffusion_weight=args.diffusion_weight,
-            )
-            loss = out["loss"]
+        trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if not trainable_params:
+            raise RuntimeError(f"No trainable parameters found for stage1 phase '{phase}'")
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            optimizer.step()
+        model.train()
+        if phase == "ae":
+            model.denoiser.eval()
+        else:
+            model.encoder.eval()
+            model.decoder.eval()
 
-            global_step += 1
-            if global_step % args.log_every == 0:
-                logger.info(
-                    "stage=1 epoch=%d step=%d loss=%.6f recon=%.6f diff=%.6f",
-                    epoch,
-                    global_step,
-                    float(out["loss"].item()),
-                    float(out["reconstruction_loss"].item()),
-                    float(out["diffusion_loss"].item()),
+        global_step = 0
+        for epoch in range(args.epochs):
+            for batch in loader:
+                x = batch["X"].to(device)
+                out = model.forward_stage1(
+                    x=x,
+                    adjacency=adjacency,
+                    mode=phase,
+                    recon_weight=args.recon_weight,
+                    diffusion_weight=args.diffusion_weight,
                 )
+                loss = out["loss"]
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
+                optimizer.step()
+
+                global_step += 1
+                if global_step % args.log_every == 0:
+                    logger.info(
+                        "stage=1 phase=%s epoch=%d step=%d loss=%.6f recon=%.6f diff=%.6f",
+                        phase,
+                        epoch,
+                        global_step,
+                        float(out["loss"].item()),
+                        float(out["reconstruction_loss"].item()),
+                        float(out["diffusion_loss"].item()),
+                    )
+                if global_step >= args.max_steps:
+                    break
             if global_step >= args.max_steps:
                 break
-        if global_step >= args.max_steps:
-            break
+
+    if optimizer is None:
+        raise RuntimeError("Stage 1 optimizer was not initialized")
 
     ensure_dir(Path(args.stage1_ckpt).parent)
     torch.save(
@@ -455,7 +483,12 @@ def train_stage3(args: argparse.Namespace, device: torch.device, logger: logging
     stage3_model.decoder.load_state_dict(stage1_model.decoder.state_dict(), strict=False)
     stage3_model.denoiser.load_state_dict(stage1_model.denoiser.state_dict(), strict=False)
 
-    optimizer = torch.optim.AdamW(stage3_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if not args.finetune_decoder:
+        freeze_module(stage3_model.decoder)
+        assert verify_frozen(stage3_model.decoder)
+
+    trainable_params = [parameter for parameter in stage3_model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     stage3_model.train()
     global_step = 0
@@ -504,9 +537,13 @@ def train_stage3(args: argparse.Namespace, device: torch.device, logger: logging
             for parameter in sensor_model.parameters():
                 if parameter.grad is not None:
                     raise AssertionError("Frozen Stage 2 sensor encoder received gradients during Stage 3")
+            if not args.finetune_decoder:
+                for parameter in stage3_model.decoder.parameters():
+                    if parameter.grad is not None:
+                        raise AssertionError("Frozen Stage 3 decoder received gradients")
 
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(stage3_model.parameters(), max_norm=args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
             optimizer.step()
 
             global_step += 1

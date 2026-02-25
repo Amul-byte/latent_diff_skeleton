@@ -265,13 +265,24 @@ class LatentDiffusion(nn.Module):
         if len(shape) != 4:
             raise AssertionError("shape must be rank-4")
 
-        total_steps = self.num_steps if steps is None else int(steps)
-        if total_steps <= 0 or total_steps > self.num_steps:
-            raise AssertionError("steps must be in [1, num_steps]")
+        if steps is None:
+            timesteps = torch.arange(self.num_steps - 1, -1, -1, device=device, dtype=torch.long)
+        else:
+            total_steps = int(steps)
+            if total_steps <= 0 or total_steps > self.num_steps:
+                raise AssertionError("steps must be in [1, num_steps]")
+            # Span the full noise range even for accelerated sampling.
+            timesteps = torch.linspace(self.num_steps - 1, 0, steps=total_steps, device=device)
+            timesteps = timesteps.round().long()
+            timesteps = torch.unique_consecutive(timesteps)
+            if timesteps[0].item() != self.num_steps - 1:
+                timesteps = torch.cat([torch.tensor([self.num_steps - 1], device=device, dtype=torch.long), timesteps])
+            if timesteps[-1].item() != 0:
+                timesteps = torch.cat([timesteps, torch.tensor([0], device=device, dtype=torch.long)])
 
         z_t = torch.randn(*shape, device=device)
-        for step in reversed(range(total_steps)):
-            t = torch.full((shape[0],), step, device=device, dtype=torch.long)
+        for step in timesteps:
+            t = torch.full((shape[0],), int(step.item()), device=device, dtype=torch.long)
             z_t = self.p_sample(denoiser=denoiser, z_t=z_t, t=t, adjacency=adjacency, h=h)
         return z_t
 
