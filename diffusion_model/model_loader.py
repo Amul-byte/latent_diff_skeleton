@@ -1,175 +1,265 @@
-"""Checkpoint loading and parameter freezing helpers."""
+"""
+model_loader.py
+
+This file helps you:
+1) Load a PyTorch checkpoint safely
+2) Find the correct "state_dict" inside the checkpoint
+3) Load weights into your model and print what matched / did not match
+4) Freeze a model (stop it from training)
+
+Goal: make it VERY easy to read and debug.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple, Union
+from typing import Any, Dict, Iterable, Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
 
 
-def _safe_torch_load(path: str, map_location: Union[str, torch.device] = "cpu") -> Any:
-    """Safely load a torch checkpoint while supporting multiple PyTorch versions.
+# ------------------------------------------------------------
+# 1) Safe torch.load (different PyTorch versions behave differently)
+# ------------------------------------------------------------
+def safe_torch_load(path: str, map_location: Union[str, torch.device] = "cpu") -> Any:
+    """
+    Load a checkpoint file from disk.
 
-    Args:
-        path: Checkpoint path.
-        map_location: Torch map location.
-
-    Returns:
-        Loaded checkpoint payload.
+    Some PyTorch versions support torch.load(..., weights_only=...)
+    and some don't. So we try one, and if it fails, we try the other.
     """
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
+        # older PyTorch doesn't have weights_only argument
         return torch.load(path, map_location=map_location)
 
 
-def _best_overlap_score(keys_a: Iterable[str], keys_b: Iterable[str]) -> int:
-    """Count overlap size between two key collections.
+# ------------------------------------------------------------
+# 2) Small helpers to compare checkpoint keys vs model keys
+# ------------------------------------------------------------
+def count_key_overlap(keys_a: Iterable[str], keys_b: Iterable[str]) -> int:
+    """
+    Count how many keys are shared between two key lists/sets.
+    """
+    return len(set(keys_a).intersection(set(keys_b)))
 
-    Args:
-        keys_a: First key iterable.
-        keys_b: Second key iterable.
+
+def state_dict_match_score(
+    candidate: Dict[str, torch.Tensor],
+    model_state: Dict[str, torch.Tensor],
+) -> Tuple[int, int]:
+    """
+    Score how well a candidate state_dict matches the model state_dict.
 
     Returns:
-        Number of shared keys.
+      (shape_matches, key_overlap)
+
+    shape_matches:
+      how many keys match AND have the same tensor shape
+    key_overlap:
+      how many keys overlap at all
     """
-    set_a = set(keys_a)
-    set_b = set(keys_b)
-    return len(set_a.intersection(set_b))
+    overlap = count_key_overlap(candidate.keys(), model_state.keys())
 
-
-def _state_dict_match_score(candidate: Dict[str, torch.Tensor], model_state: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-    """Compute compatibility score between a candidate and model state dict.
-
-    Args:
-        candidate: Candidate state dict.
-        model_state: Target model state dict.
-
-    Returns:
-        Tuple ``(shape_matches, key_overlap)``.
-    """
-    overlap = _best_overlap_score(candidate.keys(), model_state.keys())
     shape_matches = 0
-    for key, tensor in candidate.items():
-        if key in model_state:
-            target = model_state[key]
-            if hasattr(tensor, "shape") and hasattr(target, "shape") and tuple(tensor.shape) == tuple(target.shape):
-                shape_matches += 1
+    for k, v in candidate.items():
+        if k in model_state:
+            # compare shapes if both have shape
+            if hasattr(v, "shape") and hasattr(model_state[k], "shape"):
+                if tuple(v.shape) == tuple(model_state[k].shape):
+                    shape_matches += 1
+
     return shape_matches, overlap
 
 
-def _resolve_state_dict(payload: Any, model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Resolve the state dict from a checkpoint payload.
-
-    Args:
-        payload: Loaded checkpoint payload.
-        model: Target model for loading.
-
-    Returns:
-        State dict compatible with ``model.load_state_dict``.
+# ------------------------------------------------------------
+# 3) Find the real state_dict inside a checkpoint payload
+# ------------------------------------------------------------
+def resolve_state_dict(payload: Any, model: nn.Module) -> Dict[str, torch.Tensor]:
     """
-    if isinstance(payload, dict):
-        model_state = model.state_dict()
+    Checkpoints can be saved in many formats.
+    This function tries to find the actual model weights dictionary.
 
-        if "state_dict" in payload and isinstance(payload["state_dict"], dict):
-            return payload["state_dict"]
+    Common patterns:
+      payload["state_dict"]
+      payload["model"]
+      payload["ema"]
+      payload["something_else"]
+      or sometimes payload IS already the state_dict
 
-        model_key = model.__class__.__name__.lower()
-        if model_key in payload and isinstance(payload[model_key], dict):
-            return payload[model_key]
+    We try multiple options and pick the one that best matches your model.
+    """
 
-        if all(isinstance(key, str) for key in payload.keys()):
-            direct_shape_score, direct_overlap_score = _state_dict_match_score(payload, model_state)
-            direct_tensor_values = all(hasattr(value, "shape") for value in payload.values())
-            if direct_shape_score > 0 or (direct_overlap_score > 0 and direct_tensor_values):
-                return payload
+    # model.state_dict() is what we *want* to match
+    model_state = model.state_dict()
 
-            candidate_key = None
-            candidate_shape_score = 0
-            candidate_overlap_score = 0
-            for key, value in payload.items():
-                if isinstance(value, dict) and all(isinstance(item, str) for item in value.keys()):
-                    shape_score, overlap_score = _state_dict_match_score(value, model_state)
-                    if shape_score > candidate_shape_score or (
-                        shape_score == candidate_shape_score and overlap_score > candidate_overlap_score
-                    ):
-                        candidate_key = key
-                        candidate_shape_score = shape_score
-                        candidate_overlap_score = overlap_score
-            if candidate_key is not None and (candidate_shape_score > 0 or candidate_overlap_score > 0):
-                nested = payload[candidate_key]
-                if isinstance(nested, dict):
-                    return nested
+    # If payload isn't even a dict, we can't handle it
+    if not isinstance(payload, dict):
+        raise ValueError("Checkpoint payload is not a dict, cannot find state_dict.")
 
-    raise ValueError("Unable to resolve state_dict from checkpoint payload")
+    # (A) Common: payload has "state_dict"
+    if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+        return payload["state_dict"]
+
+    # (B) Sometimes payload has a key matching model class name
+    # Example: model class is "Stage3Model" -> key might be "stage3model"
+    model_key = model.__class__.__name__.lower()
+    if model_key in payload and isinstance(payload[model_key], dict):
+        return payload[model_key]
+
+    # (C) Sometimes payload itself is already a state_dict:
+    # keys are strings and values are tensors
+    # We'll detect by overlap with model keys and tensor-like values
+    all_string_keys = all(isinstance(k, str) for k in payload.keys())
+    if all_string_keys:
+        candidate = payload
+        shape_score, overlap_score = state_dict_match_score(candidate, model_state)
+        looks_like_tensors = all(hasattr(v, "shape") for v in candidate.values())
+
+        # If it overlaps enough, treat it as state_dict
+        if shape_score > 0 or (overlap_score > 0 and looks_like_tensors):
+            return candidate
+
+    # (D) Otherwise, search nested dicts inside payload and pick best match
+    best_key: Optional[str] = None
+    best_shape_score = -1
+    best_overlap_score = -1
+
+    for k, v in payload.items():
+        # only consider nested dicts with string keys
+        if isinstance(v, dict) and all(isinstance(inner_k, str) for inner_k in v.keys()):
+            shape_score, overlap_score = state_dict_match_score(v, model_state)
+
+            # choose best by:
+            # 1) more shape matches
+            # 2) if tie, more overlap
+            if (shape_score > best_shape_score) or (shape_score == best_shape_score and overlap_score > best_overlap_score):
+                best_key = k
+                best_shape_score = shape_score
+                best_overlap_score = overlap_score
+
+    if best_key is not None and (best_shape_score > 0 or best_overlap_score > 0):
+        return payload[best_key]
+
+    # If nothing worked, fail with a clear message
+    raise ValueError(
+        "Could not find a usable state_dict inside checkpoint. "
+        "Try printing checkpoint keys to see what's inside."
+    )
 
 
+# ------------------------------------------------------------
+# 4) Main function: load checkpoint into model
+# ------------------------------------------------------------
 def load_checkpoint(
     path: str,
     model: nn.Module,
     strict: bool = True,
     map_location: Union[str, torch.device] = "cpu",
 ) -> Tuple[Any, list[str], list[str]]:
-    """Load model weights from a checkpoint with diagnostics.
+    """
+    Load weights into a model.
 
     Args:
-        path: Checkpoint path.
-        model: Target model.
-        strict: Passed to ``load_state_dict``.
-        map_location: Torch map location.
+      path: checkpoint path
+      model: your torch model
+      strict:
+        True  -> must match exactly
+        False -> load what matches, ignore the rest (useful when architecture changes)
+      map_location:
+        usually "cpu" when loading on any machine
 
     Returns:
-        Tuple ``(payload, missing_keys, unexpected_keys)``.
+      (payload, missing_keys, unexpected_keys)
     """
+
     checkpoint_path = Path(path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    payload = _safe_torch_load(str(checkpoint_path), map_location=map_location)
-    state_dict = _resolve_state_dict(payload, model)
+    # 1) load raw payload
+    payload = safe_torch_load(str(checkpoint_path), map_location=map_location)
+
+    # 2) find the state_dict inside
+    state_dict = resolve_state_dict(payload, model)
+
+    # 3) load into model
     incompatible = model.load_state_dict(state_dict, strict=strict)
 
+    # 4) save diagnostic info
     missing_keys = list(incompatible.missing_keys)
     unexpected_keys = list(incompatible.unexpected_keys)
 
-    print(f"[load_checkpoint] path={checkpoint_path}")
-    print(f"[load_checkpoint] strict={strict}")
-    print(f"[load_checkpoint] missing_keys={len(missing_keys)}")
-    if missing_keys:
-        for key in missing_keys:
-            print(f"  - missing: {key}")
-    print(f"[load_checkpoint] unexpected_keys={len(unexpected_keys)}")
-    if unexpected_keys:
-        for key in unexpected_keys:
-            print(f"  - unexpected: {key}")
+    # 5) print useful debug info (so you can see what happened)
+    print("\n================ CHECKPOINT LOAD ================")
+    print(f"Path:   {checkpoint_path}")
+    print(f"Strict: {strict}")
+    print(f"Missing keys:    {len(missing_keys)}")
+    for k in missing_keys[:50]:  # print first 50 so it doesn't explode
+        print(f"  - missing: {k}")
+    if len(missing_keys) > 50:
+        print("  ... (more missing keys not shown)")
+
+    print(f"Unexpected keys: {len(unexpected_keys)}")
+    for k in unexpected_keys[:50]:
+        print(f"  - unexpected: {k}")
+    if len(unexpected_keys) > 50:
+        print("  ... (more unexpected keys not shown)")
+    print("=================================================\n")
 
     return payload, missing_keys, unexpected_keys
 
 
+# ------------------------------------------------------------
+# 5) Freeze model parameters (stop training them)
+# ------------------------------------------------------------
 def freeze_module(module: nn.Module) -> None:
-    """Freeze all parameters in a module and verify freezing.
-
-    Args:
-        module: Module to freeze.
     """
-    for parameter in module.parameters():
-        parameter.requires_grad = False
-    module.eval()
+    Freeze a module so it does NOT learn / update weights.
+
+    This is used when:
+    - you want to keep Stage 1 frozen
+    - and train only Stage 2 or Stage 3
+    """
+    for p in module.parameters():
+        p.requires_grad = False
+
+    module.eval()  # evaluation mode (turn off dropout etc.)
     verify_frozen(module)
 
 
 def verify_frozen(module: nn.Module) -> bool:
-    """Verify all module parameters are frozen.
-
-    Args:
-        module: Module to verify.
-
-    Returns:
-        ``True`` if all parameters are frozen.
     """
-    for name, parameter in module.named_parameters():
-        if parameter.requires_grad:
+    Double-check that all parameters are frozen.
+    If any parameter still wants gradients, raise an error.
+    """
+    for name, p in module.named_parameters():
+        if p.requires_grad:
             raise AssertionError(f"Parameter is not frozen: {name}")
     return True
+
+
+# ------------------------------------------------------------
+# (Optional) Nice extra helper: print checkpoint top-level keys
+# ------------------------------------------------------------
+def print_checkpoint_keys(payload: Any, max_items: int = 50) -> None:
+    """
+    If you are confused about what's inside a checkpoint,
+    call this after safe_torch_load().
+
+    Example:
+      payload = safe_torch_load("ckpt.pt")
+      print_checkpoint_keys(payload)
+    """
+    if not isinstance(payload, dict):
+        print("Checkpoint is not a dict. Type:", type(payload))
+        return
+
+    keys = list(payload.keys())
+    print(f"Checkpoint has {len(keys)} top-level keys:")
+    for k in keys[:max_items]:
+        print(" -", k)
+    if len(keys) > max_items:
+        print(" ... (more keys not shown)")

@@ -1,4 +1,26 @@
-"""Graph-based encoder/decoder/denoiser blocks for joint-aware latent modeling."""
+"""
+graph_modules.py
+
+This file contains the "graph neural network" pieces used by your models.
+
+✅ Matches your dataset.py:
+- skeleton input X from dataset: [B, T, J, 3]  where J = 32
+- adjacency matrix: [J, J]
+
+✅ Used in:
+- GraphEncoder:  X -> latent Z
+- GraphDecoder:  latent Z -> skeleton X_hat
+- GraphDenoiser: takes noisy latent Z_t and predicts noise (for diffusion)
+
+Goal here:
+- Make it easier to understand
+- Keep the SAME behavior and SAME shapes
+- Keep conditioning support:
+    h can be:
+      - None (unconditional)
+      - [B, T, D]
+      - [B, T, J, D]
+"""
 
 from __future__ import annotations
 
@@ -7,205 +29,234 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
-from diffusion_model.util import assert_last_dim, assert_rank
-
-
-try:  # pragma: no cover - optional dependency
-    from torch_geometric.nn import GATConv
-
-    HAS_TORCH_GEOMETRIC = True
-except Exception:  # pragma: no cover - optional dependency
-    GATConv = None
-    HAS_TORCH_GEOMETRIC = False
+import torch.nn.functional as F
 
 
-def sinusoidal_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
-    """Create sinusoidal timestep embeddings.
+# ------------------------------------------------------------
+# Small helper checks (easy to read)
+# ------------------------------------------------------------
+def _check_rank(name: str, x: torch.Tensor, rank: int) -> None:
+    if x.ndim != rank:
+        raise ValueError(f"{name} must have rank {rank}, got shape {tuple(x.shape)}")
 
-    Args:
-        timesteps: Integer diffusion steps [B].
-        dim: Embedding dimension.
 
-    Returns:
-        Sinusoidal embeddings with shape [B, dim].
+def _check_last_dim(name: str, x: torch.Tensor, last_dim: int) -> None:
+    if x.shape[-1] != last_dim:
+        raise ValueError(f"{name} last dim must be {last_dim}, got shape {tuple(x.shape)}")
+
+
+# ------------------------------------------------------------
+# 1) Timestep embedding (turn integer t into a vector)
+# ------------------------------------------------------------
+def sinusoidal_timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    assert_rank(timesteps, 1, "timesteps")
-    half_dim = dim // 2
-    frequency = math.log(10000.0) / max(half_dim - 1, 1)
-    frequency = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -frequency)
-    angles = timesteps.float().unsqueeze(1) * frequency.unsqueeze(0)
-    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+    Convert timestep t into a sinusoidal embedding (like Transformers).
+
+    Input:
+      t: [B] (integers)
+      dim: embedding size
+
+    Output:
+      [B, dim]
+    """
+    _check_rank("t", t, 1)
+
+    half = dim // 2
+
+    # create frequencies
+    # (classic transformer sinusoid trick)
+    freq_factor = math.log(10000.0) / max(half - 1, 1)
+    freqs = torch.exp(torch.arange(half, device=t.device, dtype=torch.float32) * -freq_factor)
+
+    # angles = t * frequency
+    angles = t.float().unsqueeze(1) * freqs.unsqueeze(0)  # [B, half]
+
+    # build sin + cos
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)  # [B, 2*half]
+
+    # if dim is odd, pad one extra
     if dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1))
+        emb = F.pad(emb, (0, 1))
+
     return emb
 
 
+# ------------------------------------------------------------
+# 2) Temporal block (1D conv over time, for each joint)
+# ------------------------------------------------------------
 class TemporalResidualBlock(nn.Module):
-    """Temporal residual 1D convolution applied independently for each joint."""
+    """
+    This runs a small CNN over time, separately for each joint.
+
+    Input:  x [B, T, J, C]
+    Output: x [B, T, J, C]  (same shape)
+    """
 
     def __init__(self, hidden_dim: int) -> None:
-        """Initialize temporal residual block.
-
-        Args:
-            hidden_dim: Feature size per joint token.
-        """
         super().__init__()
+
+        # Two Conv1d layers for time modeling
         self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.activation = nn.GELU()
+
+        # GELU activation
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run temporal residual block.
+        _check_rank("x", x, 4)
 
-        Args:
-            x: Input tensor [B, T, J, C].
+        B, T, J, C = x.shape
 
-        Returns:
-            Output tensor [B, T, J, C].
-        """
-        assert_rank(x, 4, "x")
-        batch, time, joints, channels = x.shape
-        y = x.permute(0, 2, 3, 1).contiguous().view(batch * joints, channels, time)
-        y = self.conv2(self.activation(self.conv1(y)))
-        y = y.view(batch, joints, channels, time).permute(0, 3, 1, 2).contiguous()
+        # Conv1d expects [B, C, T]
+        # We want to apply it per joint, so we flatten joints into batch:
+        # [B, T, J, C] -> [B, J, C, T] -> [B*J, C, T]
+        y = x.permute(0, 2, 3, 1).contiguous().view(B * J, C, T)
+
+        # Apply convs
+        y = self.conv1(y)
+        y = self.act(y)
+        y = self.conv2(y)
+
+        # reshape back:
+        # [B*J, C, T] -> [B, J, C, T] -> [B, T, J, C]
+        y = y.view(B, J, C, T).permute(0, 3, 1, 2).contiguous()
+
+        # residual connection: output = x + y
         return x + y
 
 
+# ------------------------------------------------------------
+# 3) Graph attention block with adjacency mask
+# ------------------------------------------------------------
 class MaskedGraphAttentionBlock(nn.Module):
-    """Adjacency-masked graph attention block.
+    """
+    This does attention across joints, but ONLY allows edges given by adjacency.
 
-    Uses `torch_geometric` GAT when available and enabled, otherwise falls back to a
-    pure PyTorch masked multi-head attention implementation.
+    Input:  x [B, T, J, C]
+    Output: x [B, T, J, C]
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int, use_torch_geometric: bool = False) -> None:
-        """Initialize graph attention block.
-
-        Args:
-            hidden_dim: Hidden feature dimension.
-            num_heads: Number of attention heads.
-            use_torch_geometric: Whether to prefer `torch_geometric` implementation.
-        """
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
         super().__init__()
+
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
 
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.use_torch_geometric = bool(use_torch_geometric and HAS_TORCH_GEOMETRIC)
 
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.ff_norm = nn.LayerNorm(hidden_dim)
+        # Norms
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        # Q, K, V projections
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Feed-forward network (MLP like transformer)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        if self.use_torch_geometric:
-            if GATConv is None:
-                raise RuntimeError("GATConv must be available when use_torch_geometric=True")
-            self.gat = GATConv(
-                in_channels=hidden_dim,
-                out_channels=self.head_dim,
-                heads=self.num_heads,
-                concat=True,
-                dropout=0.0,
-            )
-        else:
-            self.query_proj = nn.Linear(hidden_dim, hidden_dim)
-            self.key_proj = nn.Linear(hidden_dim, hidden_dim)
-            self.value_proj = nn.Linear(hidden_dim, hidden_dim)
-            self.output_proj = nn.Linear(hidden_dim, hidden_dim)
-
     def _masked_attention(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """Apply pure PyTorch masked attention.
-
-        Args:
-            x: Normalized input [B, T, J, C].
-            adjacency: Adjacency matrix [J, J].
-
-        Returns:
-            Attended tensor [B, T, J, C].
         """
-        batch, time, joints, _ = x.shape
-        q = self.query_proj(x).view(batch, time, joints, self.num_heads, self.head_dim)
-        k = self.key_proj(x).view(batch, time, joints, self.num_heads, self.head_dim)
-        v = self.value_proj(x).view(batch, time, joints, self.num_heads, self.head_dim)
+        Do masked multi-head attention across joints.
 
+        x: [B, T, J, C]
+        adjacency: [J, J] (0/1 or bool)
+
+        returns: [B, T, J, C]
+        """
+
+        B, T, J, C = x.shape
+
+        # Make Q,K,V and split into heads
+        # [B,T,J,C] -> [B,T,J,H,HD]
+        q = self.q_proj(x).view(B, T, J, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, J, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(B, T, J, self.num_heads, self.head_dim)
+
+        # Move heads earlier:
+        # q,k,v: [B,T,H,J,HD]
         q = q.permute(0, 1, 3, 2, 4)
         k = k.permute(0, 1, 3, 2, 4)
         v = v.permute(0, 1, 3, 2, 4)
 
-        attention_scores = torch.einsum("bthid,bthjd->bthij", q, k) / math.sqrt(self.head_dim)
+        # Attention scores across joints:
+        # scores: [B,T,H,J,J]
+        scores = torch.einsum("bthid,bthjd->bthij", q, k) / math.sqrt(self.head_dim)
+
+        # Mask using adjacency:
+        # adjacency [J,J] -> mask [1,1,1,J,J]
         mask = adjacency.bool().unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        attention_scores = attention_scores.masked_fill(~mask, -1e4)
-        attention_weights = torch.softmax(attention_scores, dim=-1)
 
-        attended = torch.einsum("bthij,bthjd->bthid", attention_weights, v)
-        attended = attended.permute(0, 1, 3, 2, 4).contiguous().view(batch, time, joints, self.hidden_dim)
-        return self.output_proj(attended)
+        # Put very negative number where mask is False
+        scores = scores.masked_fill(~mask, -1e4)
 
-    def _pyg_attention(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """Apply graph attention with `torch_geometric`.
+        # Softmax to get weights
+        w = torch.softmax(scores, dim=-1)
 
-        Args:
-            x: Normalized input [B, T, J, C].
-            adjacency: Adjacency matrix [J, J].
+        # Weighted sum: [B,T,H,J,HD]
+        attended = torch.einsum("bthij,bthjd->bthid", w, v)
 
-        Returns:
-            Attended tensor [B, T, J, C].
-        """
-        if GATConv is None:
-            raise RuntimeError("torch_geometric is unavailable")
+        # Merge heads back:
+        # [B,T,H,J,HD] -> [B,T,J,H,HD] -> [B,T,J,C]
+        attended = attended.permute(0, 1, 3, 2, 4).contiguous().view(B, T, J, C)
 
-        batch, time, joints, channels = x.shape
-        edge_index = adjacency.bool().nonzero(as_tuple=False).t().contiguous()
-        if edge_index.numel() == 0:
-            raise AssertionError("adjacency must contain at least one edge")
-
-        x_flat = x.view(batch * time, joints, channels)
-        outputs = []
-        for idx in range(batch * time):
-            outputs.append(self.gat(x_flat[idx], edge_index))
-        return torch.stack(outputs, dim=0).view(batch, time, joints, channels)
+        # Final projection
+        return self.out_proj(attended)
 
     def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """Run adjacency-constrained graph attention.
+        _check_rank("x", x, 4)
+        _check_rank("adjacency", adjacency, 2)
 
-        Args:
-            x: Input tensor [B, T, J, C].
-            adjacency: Adjacency matrix [J, J].
+        B, T, J, C = x.shape
 
-        Returns:
-            Output tensor [B, T, J, C].
-        """
-        assert_rank(x, 4, "x")
-        assert_rank(adjacency, 2, "adjacency")
-        _, _, joints, channels = x.shape
-        if adjacency.shape != (joints, joints):
-            raise AssertionError(f"adjacency must be [{joints}, {joints}], got {tuple(adjacency.shape)}")
-        if channels != self.hidden_dim:
-            raise AssertionError(f"x feature dim must be {self.hidden_dim}, got {channels}")
+        # adjacency must match joints
+        if adjacency.shape != (J, J):
+            raise ValueError(f"adjacency must be [{J},{J}], got {tuple(adjacency.shape)}")
 
-        adjacency = adjacency.to(device=x.device, dtype=torch.float32).clone()
-        adjacency.fill_diagonal_(1.0)
+        # feature dim must match hidden_dim
+        if C != self.hidden_dim:
+            raise ValueError(f"x feature dim must be {self.hidden_dim}, got {C}")
 
-        normalized = self.norm(x)
-        if self.use_torch_geometric:
-            attended = self._pyg_attention(normalized, adjacency)
-        else:
-            attended = self._masked_attention(normalized, adjacency)
+        # ensure adjacency is float/bool on right device
+        adjacency = adjacency.to(device=x.device)
 
-        x = x + attended
-        x = x + self.ffn(self.ff_norm(x))
+        # add self-loops (each joint can attend to itself)
+        # We make a copy so we don't modify the original
+        adjacency = adjacency.clone()
+        adjacency.fill_diagonal_(1)
+
+        # ---- Attention block (with residual) ----
+        x_norm = self.norm1(x)
+        attn_out = self._masked_attention(x_norm, adjacency)
+        x = x + attn_out
+
+        # ---- Feed-forward block (with residual) ----
+        x_norm2 = self.norm2(x)
+        x = x + self.ffn(x_norm2)
+
         return x
 
 
+# ------------------------------------------------------------
+# 4) GraphEncoder: skeleton -> latent
+# ------------------------------------------------------------
 class GraphEncoder(nn.Module):
-    """Joint-aware graph encoder mapping skeleton coordinates to latent trajectories."""
+    """
+    Input:
+      X: [B,T,J,3]
+    Output:
+      Z: [B,T,J,latent_dim]
+    """
 
     def __init__(
         self,
@@ -216,62 +267,62 @@ class GraphEncoder(nn.Module):
         num_heads: int = 8,
         use_torch_geometric: bool = False,
     ) -> None:
-        """Initialize graph encoder.
-
-        Args:
-            joint_dim: Input per-joint feature dimension.
-            hidden_dim: Internal hidden size.
-            latent_dim: Output latent size.
-            num_layers: Number of graph attention blocks.
-            num_heads: Attention heads per block.
-            use_torch_geometric: Whether to use PyG GAT path.
-        """
         super().__init__()
+        _ = use_torch_geometric
+
         self.joint_dim = joint_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        self.input_proj = nn.Linear(joint_dim, hidden_dim)
-        self.graph_blocks = nn.ModuleList(
-            [
-                MaskedGraphAttentionBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    use_torch_geometric=use_torch_geometric,
-                )
-                for _ in range(num_layers)
-            ]
+        # project xyz into hidden space
+        self.in_proj = nn.Linear(joint_dim, hidden_dim)
+
+        # graph attention layers
+        self.graph_layers = nn.ModuleList(
+            [MaskedGraphAttentionBlock(hidden_dim=hidden_dim, num_heads=num_heads) for _ in range(num_layers)]
         )
-        self.temporal_blocks = nn.ModuleList([TemporalResidualBlock(hidden_dim) for _ in range(2)])
-        self.output_proj = nn.Linear(hidden_dim, latent_dim)
+
+        # temporal layers (over time)
+        self.temp_layers = nn.ModuleList([TemporalResidualBlock(hidden_dim) for _ in range(2)])
+
+        # project hidden into latent space
+        self.out_proj = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, x: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """Encode skeleton sequences.
+        _check_rank("x", x, 4)
+        _check_last_dim("x", x, self.joint_dim)
+        _check_rank("adjacency", adjacency, 2)
 
-        Args:
-            x: Skeleton tensor [B, T, J, 3].
-            adjacency: Adjacency matrix [J, J].
+        # xyz -> hidden
+        h = self.in_proj(x)
 
-        Returns:
-            Latent tensor [B, T, J, latent_dim].
-        """
-        assert_rank(x, 4, "x")
-        assert_last_dim(x, self.joint_dim, "x")
-        assert_rank(adjacency, 2, "adjacency")
+        # run graph layers
+        for layer in self.graph_layers:
+            h = layer(h, adjacency)
 
-        hidden = self.input_proj(x)
-        for graph_block in self.graph_blocks:
-            hidden = graph_block(hidden, adjacency)
-        for temporal_block in self.temporal_blocks:
-            hidden = temporal_block(hidden)
-        latent = self.output_proj(hidden)
-        assert_rank(latent, 4, "latent")
-        assert_last_dim(latent, self.latent_dim, "latent")
-        return latent
+        # run temporal layers
+        for layer in self.temp_layers:
+            h = layer(h)
+
+        # hidden -> latent
+        z = self.out_proj(h)
+
+        _check_rank("z", z, 4)
+        _check_last_dim("z", z, self.latent_dim)
+
+        return z
 
 
+# ------------------------------------------------------------
+# 5) GraphDecoder: latent -> skeleton
+# ------------------------------------------------------------
 class GraphDecoder(nn.Module):
-    """Joint-aware graph decoder mapping latent trajectories back to skeleton coordinates."""
+    """
+    Input:
+      Z: [B,T,J,latent_dim]
+    Output:
+      X_hat: [B,T,J,3]
+    """
 
     def __init__(
         self,
@@ -282,62 +333,65 @@ class GraphDecoder(nn.Module):
         num_heads: int = 8,
         use_torch_geometric: bool = False,
     ) -> None:
-        """Initialize graph decoder.
-
-        Args:
-            latent_dim: Input latent size.
-            hidden_dim: Internal hidden size.
-            joint_dim: Output per-joint coordinate size.
-            num_layers: Number of graph attention blocks.
-            num_heads: Attention heads per block.
-            use_torch_geometric: Whether to use PyG GAT path.
-        """
         super().__init__()
+        _ = use_torch_geometric
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.joint_dim = joint_dim
 
-        self.input_proj = nn.Linear(latent_dim, hidden_dim)
-        self.temporal_blocks = nn.ModuleList([TemporalResidualBlock(hidden_dim) for _ in range(2)])
-        self.graph_blocks = nn.ModuleList(
-            [
-                MaskedGraphAttentionBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    use_torch_geometric=use_torch_geometric,
-                )
-                for _ in range(num_layers)
-            ]
+        # latent -> hidden
+        self.in_proj = nn.Linear(latent_dim, hidden_dim)
+
+        # temporal layers first
+        self.temp_layers = nn.ModuleList([TemporalResidualBlock(hidden_dim) for _ in range(2)])
+
+        # graph layers
+        self.graph_layers = nn.ModuleList(
+            [MaskedGraphAttentionBlock(hidden_dim=hidden_dim, num_heads=num_heads) for _ in range(num_layers)]
         )
-        self.output_proj = nn.Linear(hidden_dim, joint_dim)
 
-    def forward(self, latent: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
-        """Decode latent trajectories.
+        # hidden -> xyz
+        self.out_proj = nn.Linear(hidden_dim, joint_dim)
 
-        Args:
-            latent: Latent tensor [B, T, J, latent_dim].
-            adjacency: Adjacency matrix [J, J].
+    def forward(self, z: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        _check_rank("z", z, 4)
+        _check_last_dim("z", z, self.latent_dim)
+        _check_rank("adjacency", adjacency, 2)
 
-        Returns:
-            Reconstructed skeleton tensor [B, T, J, 3].
-        """
-        assert_rank(latent, 4, "latent")
-        assert_last_dim(latent, self.latent_dim, "latent")
-        assert_rank(adjacency, 2, "adjacency")
+        h = self.in_proj(z)
 
-        hidden = self.input_proj(latent)
-        for temporal_block in self.temporal_blocks:
-            hidden = temporal_block(hidden)
-        for graph_block in self.graph_blocks:
-            hidden = graph_block(hidden, adjacency)
-        reconstruction = self.output_proj(hidden)
-        assert_rank(reconstruction, 4, "reconstruction")
-        assert_last_dim(reconstruction, self.joint_dim, "reconstruction")
-        return reconstruction
+        for layer in self.temp_layers:
+            h = layer(h)
+
+        for layer in self.graph_layers:
+            h = layer(h, adjacency)
+
+        x_hat = self.out_proj(h)
+
+        _check_rank("x_hat", x_hat, 4)
+        _check_last_dim("x_hat", x_hat, self.joint_dim)
+
+        return x_hat
 
 
+# ------------------------------------------------------------
+# 6) GraphDenoiserMasked: noisy latent -> predicted noise
+# ------------------------------------------------------------
 class GraphDenoiserMasked(nn.Module):
-    """Joint-aware latent denoiser conditioned on diffusion timestep and optional IMU embedding."""
+    """
+    This predicts the noise added to the latent.
+
+    Input:
+      z_t: [B,T,J,D]
+      t:   [B]
+      h:   optional conditioning
+           - None
+           - [B,T,D]
+           - [B,T,J,D]
+    Output:
+      noise_hat: [B,T,J,D]
+    """
 
     def __init__(
         self,
@@ -347,66 +401,63 @@ class GraphDenoiserMasked(nn.Module):
         num_heads: int = 8,
         use_torch_geometric: bool = False,
     ) -> None:
-        """Initialize conditional denoiser.
-
-        Args:
-            latent_dim: Latent input/output size.
-            hidden_dim: Hidden feature size.
-            num_layers: Number of graph attention blocks.
-            num_heads: Attention heads.
-            use_torch_geometric: Whether to use PyG GAT path.
-        """
         super().__init__()
+        _ = use_torch_geometric
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
 
-        self.input_proj = nn.Linear(latent_dim, hidden_dim)
+        # latent -> hidden
+        self.in_proj = nn.Linear(latent_dim, hidden_dim)
+
+        # time embedding MLP
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # conditioning projection (expects last dim = latent_dim)
         self.cond_proj = nn.Linear(latent_dim, hidden_dim)
 
-        self.graph_blocks = nn.ModuleList(
-            [
-                MaskedGraphAttentionBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    use_torch_geometric=use_torch_geometric,
-                )
-                for _ in range(num_layers)
-            ]
+        # graph layers
+        self.graph_layers = nn.ModuleList(
+            [MaskedGraphAttentionBlock(hidden_dim=hidden_dim, num_heads=num_heads) for _ in range(num_layers)]
         )
-        self.temporal_block = TemporalResidualBlock(hidden_dim)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, latent_dim)
 
-    def _prepare_conditioning(self, h: Optional[torch.Tensor], target_shape: torch.Size) -> Optional[torch.Tensor]:
-        """Normalize conditioning tensor to shape [B, T, J, D].
+        # temporal
+        self.temp = TemporalResidualBlock(hidden_dim)
 
-        Args:
-            h: Optional conditioning tensor, [B, T, D] or [B, T, J, D].
-            target_shape: Target latent shape [B, T, J, D].
+        # output
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, latent_dim)
 
-        Returns:
-            Conditioning tensor with shape [B, T, J, D], or ``None``.
+    def _prepare_h(self, h: Optional[torch.Tensor], target_shape: torch.Size) -> Optional[torch.Tensor]:
+        """
+        Convert h into shape [B,T,J,D] so it can be added to hidden.
+
+        target_shape is z_t.shape which is [B,T,J,D]
         """
         if h is None:
             return None
 
+        # h could be [B,T,D]
         if h.ndim == 3:
-            batch, time, dim = h.shape
-            if (batch, time) != (target_shape[0], target_shape[1]):
-                raise AssertionError("conditioning [B, T, D] must align with latent [B, T, J, D]")
-            h = h.unsqueeze(2).expand(batch, time, target_shape[2], dim)
+            B, T, D = h.shape
+            if (B, T) != (target_shape[0], target_shape[1]):
+                raise ValueError("h [B,T,D] must match z_t [B,T,J,D] on first 2 dims")
+            # expand to [B,T,J,D]
+            h = h.unsqueeze(2).expand(B, T, target_shape[2], D)
+
+        # or h could already be [B,T,J,D]
         elif h.ndim == 4:
             if tuple(h.shape[:3]) != tuple(target_shape[:3]):
-                raise AssertionError("conditioning [B, T, J, D] must align with latent first 3 dims")
-        else:
-            raise AssertionError(f"conditioning rank must be 3 or 4, got {h.ndim}")
+                raise ValueError("h [B,T,J,D] must match z_t on [B,T,J]")
 
-        assert_last_dim(h, self.latent_dim, "conditioning")
+        else:
+            raise ValueError("h must be rank 3 or 4")
+
+        _check_last_dim("h", h, self.latent_dim)
         return h
 
     def forward(
@@ -416,41 +467,52 @@ class GraphDenoiserMasked(nn.Module):
         adjacency: torch.Tensor,
         h: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict diffusion noise.
+        _check_rank("z_t", z_t, 4)
+        _check_rank("t", t, 1)
+        _check_rank("adjacency", adjacency, 2)
+        _check_last_dim("z_t", z_t, self.latent_dim)
 
-        Args:
-            z_t: Noisy latent tensor [B, T, J, D].
-            t: Timesteps [B].
-            adjacency: Adjacency matrix [J, J].
-            h: Optional conditioning tensor [B, T, D] or [B, T, J, D].
-
-        Returns:
-            Predicted noise tensor [B, T, J, D].
-        """
-        assert_rank(z_t, 4, "z_t")
-        assert_rank(t, 1, "t")
-        assert_last_dim(z_t, self.latent_dim, "z_t")
-        assert_rank(adjacency, 2, "adjacency")
+        # t must match batch size
         if t.shape[0] != z_t.shape[0]:
-            raise AssertionError("t must contain one timestep per batch element")
+            raise ValueError("t must have one timestep per batch item")
 
-        batch, _, joints, _ = z_t.shape
-        if adjacency.shape != (joints, joints):
-            raise AssertionError(f"adjacency must be [{joints}, {joints}], got {tuple(adjacency.shape)}")
+        B, T, J, D = z_t.shape
 
-        conditioning = self._prepare_conditioning(h, z_t.shape)
+        # adjacency must match joints
+        if adjacency.shape != (J, J):
+            raise ValueError(f"adjacency must be [{J},{J}], got {tuple(adjacency.shape)}")
 
-        hidden = self.input_proj(z_t)
-        time_embedding = sinusoidal_timestep_embedding(t, self.hidden_dim)
-        hidden = hidden + self.time_mlp(time_embedding).view(batch, 1, 1, self.hidden_dim)
-        if conditioning is not None:
-            hidden = hidden + self.cond_proj(conditioning)
+        # Make conditioning shape [B,T,J,D] if provided
+        h = self._prepare_h(h, z_t.shape)
 
-        for graph_block in self.graph_blocks:
-            hidden = graph_block(hidden, adjacency)
-        hidden = self.temporal_block(hidden)
-        noise = self.output_proj(self.output_norm(hidden))
+        # ---- Build hidden ----
+        hidden = self.in_proj(z_t)  # [B,T,J,hidden_dim]
 
-        assert_rank(noise, 4, "noise")
-        assert noise.shape == z_t.shape, "predicted noise must match z_t shape"
-        return noise
+        # time embedding: [B,hidden_dim]
+        t_emb = sinusoidal_timestep_embedding(t, self.hidden_dim)
+
+        # pass through time MLP: [B,hidden_dim]
+        t_emb = self.time_mlp(t_emb)
+
+        # add time embedding to every (T,J) token:
+        # [B,hidden_dim] -> [B,1,1,hidden_dim]
+        hidden = hidden + t_emb.view(B, 1, 1, self.hidden_dim)
+
+        # add conditioning if we have it
+        if h is not None:
+            hidden = hidden + self.cond_proj(h)
+
+        # ---- Graph + temporal blocks ----
+        for layer in self.graph_layers:
+            hidden = layer(hidden, adjacency)
+
+        hidden = self.temp(hidden)
+
+        # ---- Output predicted noise ----
+        noise_hat = self.out_proj(self.out_norm(hidden))
+
+        # final safety checks
+        if noise_hat.shape != z_t.shape:
+            raise ValueError("noise_hat must have same shape as z_t")
+
+        return noise_hat

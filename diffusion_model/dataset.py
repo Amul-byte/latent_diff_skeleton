@@ -1,377 +1,763 @@
-"""Datasets for skeleton and acceleration-only multimodal training.
+# ============================================================
+# This file helps you load SmartFall data from CSV files
+# and turn it into training samples (windows) for a model.
+#
+# It works with:
+#   1) Skeleton CSVs (32 joints -> 32 * 3 = 96 numbers per frame)
+#   2) Sensor 1 CSVs (last 3 columns are accel x,y,z)
+#   3) Sensor 2 CSVs (last 3 columns are accel x,y,z)
+#
+# Each CSV filename looks like: S01A10T03.csv
+#   S01 = subject 01
+#   A10 = activity 10
+#   T03 = trial 03
+#
+# We will create windows of length T (example: 90 frames)
+# so the model always sees the same size input.
+# ============================================================
 
-This module supports two acceleration sensors (for example: ``meta_hip`` +
-``meta_wrist`` or ``phone`` + ``watch``) and applies per-sensor normalization.
-"""
-
-from __future__ import annotations
-
+import os               # lets us look inside folders and list files
+import re               # lets us find patterns like "A10" inside filenames
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Optional, Tuple
+import pandas as pd     # reads CSV files into tables (DataFrames)
+import numpy as np      # fast math arrays
+import torch            # tensors for PyTorch
+from torch.utils.data import Dataset  # base class for PyTorch datasets
 
-import torch
-from torch.utils.data import Dataset
+# ------------------------------------------------------------
+# PART 1) READ ALL CSV FILES FROM A FOLDER
+# ------------------------------------------------------------
 
-from diffusion_model.util import assert_last_dim, assert_rank
+def read_csv_files(folder):
+    """
+    Read every .csv file in a folder.
+    Return a dictionary:
+        key   = filename (example: "S01A01T01.csv")
+        value = pandas DataFrame (the CSV data)
+    """
+
+    # get all file names in the folder that end with ".csv"
+    files = [f for f in os.listdir(folder) if f.endswith(".csv")]
+
+    # this will store all CSV tables
+    data = {}
+
+    # loop through each csv filename
+    for file in files:
+
+        # build the full path like ".../folder/S01A01T01.csv"
+        file_path = os.path.join(folder, file)
+
+        try:
+            # read the csv into a DataFrame (header=None means no header row)
+            data[file] = pd.read_csv(file_path, header=None)
+
+        # if file is empty or broken, skip it
+        except pd.errors.EmptyDataError:
+            print(f"[dataset] Skipped empty/unreadable file: {file}")
+
+        # if any other error happens, skip it and print why
+        except Exception as e:
+            print(f"[dataset] Skipped file {file} due to error: {e}")
+
+    # return the dictionary of all loaded CSVs
+    return data
+
+
+def common_files(*dicts):
+    """
+    Find filenames that exist in ALL input dictionaries.
+
+    Example:
+      skeleton_data has "S01A01T01.csv"
+      sensor1_data has "S01A01T01.csv"
+      sensor2_data has "S01A01T01.csv"
+    Then that file is common.
+
+    Returns a sorted list of common filenames.
+    """
+
+    # if no dictionaries were given, return empty list
+    if not dicts:
+        return []
+
+    # start with keys from the first dictionary
+    s = set(dicts[0].keys())
+
+    # keep only filenames that are also in every other dictionary
+    for d in dicts[1:]:
+        s &= set(d.keys())
+
+    # return as a sorted list (nice and consistent order)
+    return sorted(list(s))
+
+
+# ------------------------------------------------------------
+# PART 2) FIX NaNs (missing values)
+# ------------------------------------------------------------
+
+def fill_nan_with_col_mean(x: np.ndarray) -> np.ndarray:
+    """
+    Sometimes data has NaN (means missing / not a number).
+    We replace NaNs using the average (mean) of that column.
+
+    If a whole column is ALL NaNs, we set that column to 0.
+    """
+
+    # make sure the array is float32 (common for ML) and make a copy
+    x = x.astype(np.float32, copy=True)
+
+    # find columns where every single value is NaN
+    all_nan_cols = np.all(np.isnan(x), axis=0)
+
+    # if there are any "all NaN columns", replace them with zeros
+    if np.any(all_nan_cols):
+        x[:, all_nan_cols] = 0.0
+
+    # compute the mean of each column, ignoring NaNs
+    col_mean = np.nanmean(x, axis=0)
+
+    # find where NaNs are located
+    nan_mask = np.isnan(x)
+
+    # if there are NaNs, replace them with the column mean
+    if np.any(nan_mask):
+        # np.take(col_mean, ...) picks the right mean for each NaN position
+        x[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])
+
+    # return the cleaned array
+    return x
+
+
+# ------------------------------------------------------------
+# PART 3) GET LABELS AND SUBJECT IDS FROM THE FILENAME
+# ------------------------------------------------------------
+
+# This looks for "A" followed by 2 digits, like A01, A10, A14
+ACT_RE = re.compile(r"A(\d{2})", re.IGNORECASE)
+
+# This looks for "S" followed by 2 digits, like S01, S12
+SUB_RE = re.compile(r"S(\d{2})", re.IGNORECASE)
+
+
+def label_from_filename_binary(fname: str, fall_activities=(10, 11, 12, 13, 14)) -> int:
+    """
+    We make a simple label:
+      0 = normal activity (ADL)
+      1 = fall
+
+    By default, SmartFall falls are activities A10 to A14.
+
+    Example:
+      "S01A10T03.csv" -> activity 10 -> label 1 (fall)
+      "S01A02T01.csv" -> activity 2  -> label 0 (ADL)
+    """
+
+    # find activity code in the filename
+    m = ACT_RE.search(fname)
+
+    # if it cannot find Axx, raise an error
+    if not m:
+        raise ValueError(f"Cannot parse activity code from filename: {fname}")
+
+    # convert "10" into number 10
+    act = int(m.group(1))
+
+    # if activity is a fall activity, return 1 else 0
+    return 1 if act in set(fall_activities) else 0
+
+
+def subject_from_filename(fname: str) -> int:
+    """
+    Get subject number from filename.
+
+    Example:
+      "S01A01T01.csv" -> subject 01 -> returns 1
+    """
+
+    # find subject code in the filename
+    m = SUB_RE.search(fname)
+
+    # if it cannot find Sxx, raise an error
+    if not m:
+        raise ValueError(f"Cannot parse subject id from filename: {fname}")
+
+    # convert "01" into number 1
+    return int(m.group(1))
+
+
+# ------------------------------------------------------------
+# PART 4) SKELETON: TURN [T,96] into [T,32,3]
+# ------------------------------------------------------------
+
+def skeleton_window_to_T32x3(skel_win: np.ndarray) -> np.ndarray:
+    """
+    Skeleton CSV per frame often has:
+      - 96 columns (32 joints * 3 numbers per joint)
+      OR
+      - 97 columns (first column is an index, then 96 skeleton values)
+
+    Input:
+      skel_win shape = [T, 96] or [T, 97]
+
+    Output:
+      [T, 32, 3]
+      meaning:
+        T frames,
+        32 joints,
+        each joint has (x,y,z)
+    """
+
+    # check it is 2D (rows and columns)
+    if skel_win.ndim != 2:
+        raise ValueError(f"Skeleton window must be 2D [T,C]. Got {skel_win.shape}")
+
+    # if there is an extra first column (97 columns), drop it
+    if skel_win.shape[1] == 97:
+        skel_win = skel_win[:, 1:]
+
+    # now it MUST be 96 columns
+    if skel_win.shape[1] != 96:
+        raise ValueError(f"Expected skeleton cols=96 (or 97 with index). Got {skel_win.shape[1]}")
+
+    # number of frames in this window
+    T = skel_win.shape[0]
+
+    # reshape from [T, 96] to [T, 32, 3]
+    # because 96 = 32 * 3
+    return skel_win.reshape(T, 32, 3).astype(np.float32)
+
+
+# ------------------------------------------------------------
+# PART 5) IMU NORMALIZATION (Z-SCORE)
+# ------------------------------------------------------------
+
+def compute_zscore_stats(accel: torch.Tensor, eps: float = 1e-6):
+    """
+    accel is a tensor shaped [N, T, 3]
+      N = number of windows (samples)
+      T = frames per window
+      3 = x,y,z
+
+    We compute:
+      mean = average value for each axis (x,y,z)
+      std  = standard deviation for each axis
+
+    We keep shape [1,1,3] so it can broadcast easily.
+
+    eps is a tiny number so we never divide by zero.
+    """
+
+    # mean over sample dimension and time dimension
+    mean = accel.mean(dim=(0, 1), keepdim=True)
+
+    # std over sample dimension and time dimension
+    std = accel.std(dim=(0, 1), keepdim=True).clamp_min(eps)
+
+    # return both stats
+    return {"mean": mean, "std": std}
+
+
+def normalize_accel(
+    accel: torch.Tensor,
+    stats: dict,
+    eps: float = 1e-6,
+    clip: float | None = 6.0,
+) -> torch.Tensor:
+    """
+    Normalize accel data using:
+      (accel - mean) / std
+
+    accel: [N,T,3]  (or [1,T,3] for one window)
+    stats: {"mean": [1,1,3], "std": [1,1,3]}
+
+    clip: if not None, clamp values into [-clip, +clip]
+    """
+
+    # make sure mean and std are tensors
+    mean = torch.as_tensor(stats["mean"], dtype=accel.dtype)
+    std = torch.as_tensor(stats["std"], dtype=accel.dtype).clamp_min(eps)
+
+    # z-score normalize
+    out = (accel - mean) / std
+
+    # optional clipping (keeps extreme spikes from exploding training)
+    if clip is not None:
+        c = float(clip)
+        out = out.clamp(-c, c)
+
+    return out
+
+
+# ------------------------------------------------------------
+# PART 6) THE PYTORCH DATASET CLASS
+# ------------------------------------------------------------
+
+class SmartFallPairedSlidingWindowDataset(Dataset):
+    """
+    This dataset builds training samples (windows) from SmartFall CSVs.
+
+    Each sample you get is a dictionary with:
+      "X"      : skeleton window  [T, 32, 3]
+      "A1"     : sensor1 accel    [T, 3]
+      "A2"     : sensor2 accel    [T, 3]
+      "A_pair" : stacked accel    [2, T, 3]
+      "y"      : label (0 or 1)
+    """
+
+    def __init__(
+        self,
+        skeleton_data: dict,
+        sensor1_data: dict,
+        sensor2_data: dict,
+        window_size: int = 90,
+        stride: int = 30,
+        fall_activities=(10, 11, 12, 13, 14),
+        drop_misaligned: bool = True,
+
+        # Filter which files/subjects to use (helps subject-wise split)
+        allowed_files: list[str] | None = None,
+        allowed_subjects: list[int] | None = None,
+
+        # IMU normalization settings
+        imu_normalization: str = "zscore",   # "zscore" or "none"
+        imu_stats: dict | None = None,       # pass train stats here for val/test
+        imu_eps: float = 1e-6,
+        imu_clip: float | None = 6.0,
+        sensor_names: tuple[str, str] = ("sensor1", "sensor2"),
+    ):
+        # store the input CSV dictionaries
+        self.skeleton_data = skeleton_data
+        self.sensor1_data = sensor1_data
+        self.sensor2_data = sensor2_data
+
+        # store window settings
+        self.window_size = int(window_size)
+        self.stride = int(stride)
+
+        # store fall activities list
+        self.fall_activities = tuple(int(x) for x in fall_activities)
+
+        # if True, skip trials where row counts mismatch
+        self.drop_misaligned = bool(drop_misaligned)
+
+        # store IMU normalization settings
+        self.imu_normalization = imu_normalization
+        self.imu_eps = float(imu_eps)
+        self.imu_clip = imu_clip
+        self.sensor_names = sensor_names
+
+        # find filenames common across skeleton/sensor1/sensor2
+        files = common_files(skeleton_data, sensor1_data, sensor2_data)
+
+        # if no common files, dataset cannot be built
+        if not files:
+            raise ValueError("No common filenames across skeleton/sensor1/sensor2 inputs.")
+
+        # -------------------------
+        # OPTIONAL FILTERING
+        # -------------------------
+
+        # if allowed_files is given, keep only those filenames
+        if allowed_files is not None:
+            allowed_set = set(allowed_files)
+            files = [f for f in files if f in allowed_set]
+
+        # if allowed_subjects is given, keep only those subjects
+        if allowed_subjects is not None:
+            subj_set = set(int(s) for s in allowed_subjects)
+            files = [f for f in files if subject_from_filename(f) in subj_set]
+
+        # if filtering removed everything, error
+        if not files:
+            raise ValueError("After filtering, no files remain. Check allowed_files/allowed_subjects.")
+
+        # store final file list
+        self.files = files
+
+        # ------------------------------------------------
+        # BUILD AN INDEX OF ALL WINDOWS
+        # ------------------------------------------------
+        # self.index will store tuples: (filename, window_start_frame)
+        self.index = []
+
+        # labels for each window
+        labels = []
+
+        # loop over each file/trial
+        for fname in self.files:
+
+            # get the DataFrames for this file
+            skel_df = self.skeleton_data[fname]
+            s1_df = self.sensor1_data[fname]
+            s2_df = self.sensor2_data[fname]
+
+            # get number of rows (frames) in each
+            n0 = len(skel_df)
+            n1 = len(s1_df)
+            n2 = len(s2_df)
+
+            # if frame counts do not match, either skip or error
+            if not (n0 == n1 == n2):
+                if self.drop_misaligned:
+                    continue
+                raise ValueError(f"Frame mismatch {fname}: skel={n0}, s1={n1}, s2={n2}")
+
+            # label from filename (0 or 1)
+            y = label_from_filename_binary(fname, fall_activities=self.fall_activities)
+
+            # how many frames in this trial
+            n_frames = n0
+
+            # window length
+            T = self.window_size
+
+            # stride step
+            step = self.stride
+
+            # if trial is shorter than one window, skip
+            if n_frames < T:
+                continue
+
+            # number of windows we can slide through
+            num_windows = (n_frames - T) // step + 1
+
+            # add each window start to the index list
+            for i in range(num_windows):
+                start = i * step
+                self.index.append((fname, start))
+                labels.append(y)
+
+        # if no windows were created, error
+        if not self.index:
+            raise ValueError("No windows created. Check window_size/stride or data lengths.")
+
+        # store labels as a torch tensor
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+        # ------------------------------------------------
+        # IMU NORMALIZATION STATS
+        # ------------------------------------------------
+        # If zscore normalization is ON:
+        #   - Use imu_stats if provided (val/test)
+        #   - Else compute stats from this dataset windows (train)
+        self.normalization_stats = None
+
+        # only allow two choices
+        if self.imu_normalization not in ("zscore", "none"):
+            raise ValueError("imu_normalization must be 'zscore' or 'none'")
+
+        # if we want zscore normalization
+        if self.imu_normalization == "zscore":
+
+            # CASE 1: stats were given (use them)
+            if imu_stats is not None:
+                s1_name, s2_name = sensor_names
+
+                self.normalization_stats = {
+                    s1_name: {
+                        "mean": torch.as_tensor(imu_stats[s1_name]["mean"]),
+                        "std":  torch.as_tensor(imu_stats[s1_name]["std"]),
+                    },
+                    s2_name: {
+                        "mean": torch.as_tensor(imu_stats[s2_name]["mean"]),
+                        "std":  torch.as_tensor(imu_stats[s2_name]["std"]),
+                    },
+                }
+
+            # CASE 2: stats NOT given (compute from data)
+            else:
+                A1_all = []  # will store every sensor1 window
+                A2_all = []  # will store every sensor2 window
+
+                # loop over every window index
+                for (fname, start) in self.index:
+                    end = start + self.window_size
+
+                    # read the correct rows for accel (last 3 columns)
+                    s1_df = self.sensor1_data[fname]
+                    s2_df = self.sensor2_data[fname]
+
+                    s1_win = s1_df.iloc[start:end, -3:].values
+                    s2_win = s2_df.iloc[start:end, -3:].values
+
+                    # fix NaNs
+                    s1_win = fill_nan_with_col_mean(s1_win)
+                    s2_win = fill_nan_with_col_mean(s2_win)
+
+                    # store
+                    A1_all.append(s1_win.astype(np.float32))
+                    A2_all.append(s2_win.astype(np.float32))
+
+                # stack into big tensors:
+                # A1_t shape = [N, T, 3]
+                A1_t = torch.tensor(np.stack(A1_all, axis=0), dtype=torch.float32)
+                A2_t = torch.tensor(np.stack(A2_all, axis=0), dtype=torch.float32)
+
+                # compute mean/std for each sensor
+                s1_name, s2_name = sensor_names
+                self.normalization_stats = {
+                    s1_name: compute_zscore_stats(A1_t, eps=self.imu_eps),
+                    s2_name: compute_zscore_stats(A2_t, eps=self.imu_eps),
+                }
+
+    def __len__(self):
+        # total number of windows
+        return len(self.index)
+
+    def get_normalization_stats(self) -> dict | None:
+        """
+        Return a safe copy of normalization stats.
+        You use this from TRAIN dataset and pass into VAL/TEST dataset.
+        """
+        if self.normalization_stats is None:
+            return None
+
+        out = {}
+        for k, v in self.normalization_stats.items():
+            out[k] = {
+                "mean": v["mean"].clone(),
+                "std": v["std"].clone(),
+            }
+        return out
+
+    def __getitem__(self, idx):
+        """
+        Get one training sample (one window).
+        """
+
+        # get which file and where the window starts
+        fname, start = self.index[idx]
+
+        # window end
+        end = start + self.window_size
+
+        # get the DataFrames for that file
+        skel_df = self.skeleton_data[fname]
+        s1_df = self.sensor1_data[fname]
+        s2_df = self.sensor2_data[fname]
+
+        # cut out the window rows
+        skel_win = skel_df.iloc[start:end, :].values      # all skeleton cols
+        s1_win = s1_df.iloc[start:end, -3:].values        # last 3 accel cols
+        s2_win = s2_df.iloc[start:end, -3:].values        # last 3 accel cols
+
+        # fix NaNs in all three windows
+        skel_win = fill_nan_with_col_mean(skel_win)
+        s1_win = fill_nan_with_col_mean(s1_win)
+        s2_win = fill_nan_with_col_mean(s2_win)
+
+        # reshape skeleton to [T,32,3]
+        X = skeleton_window_to_T32x3(skel_win)
+
+        # convert everything into torch tensors
+        X_t = torch.tensor(X, dtype=torch.float32)           # [T,32,3]
+        A1_t = torch.tensor(s1_win, dtype=torch.float32)     # [T,3]
+        A2_t = torch.tensor(s2_win, dtype=torch.float32)     # [T,3]
+
+        # get label for this window
+        y_t = self.labels[idx]
+
+        # if we want zscore normalization, apply it now (per sensor)
+        if self.imu_normalization == "zscore":
+            if self.normalization_stats is None:
+                raise RuntimeError("imu_normalization='zscore' but normalization_stats is None.")
+
+            s1_name, s2_name = self.sensor_names
+
+            # normalize A1_t:
+            # we temporarily add a batch dimension [1,T,3], normalize, then remove it
+            A1_t = normalize_accel(
+                A1_t.unsqueeze(0),                       # [1,T,3]
+                self.normalization_stats[s1_name],        # mean/std
+                eps=self.imu_eps,
+                clip=self.imu_clip,
+            ).squeeze(0)                                  # back to [T,3]
+
+            # normalize A2_t similarly
+            A2_t = normalize_accel(
+                A2_t.unsqueeze(0),
+                self.normalization_stats[s2_name],
+                eps=self.imu_eps,
+                clip=self.imu_clip,
+            ).squeeze(0)
+
+        # stack both sensors into one tensor [2,T,3]
+        A_pair = torch.stack([A1_t, A2_t], dim=0)
+
+        # return a dictionary (easy for training code)
+        return {
+            "X": X_t,                                  # skeleton [T,32,3]
+            "A1": A1_t,                                # sensor1 [T,3]
+            "A2": A2_t,                                # sensor2 [T,3]
+            "A_pair": A_pair,                          # both sensors [2,T,3]
+            "y": y_t,                                  # label scalar
+            "file": fname,                             # debug info
+            "start": torch.tensor(start, dtype=torch.long),  # debug info
+        }
+
+
+# ------------------------------------------------------------
+# PART 7) Lightweight tensor datasets used by train.py/generate.py
+# ------------------------------------------------------------
 
 
 @dataclass
 class NormalizationConfig:
-    """Configuration for acceleration normalization.
-
-    Attributes:
-        mode: Normalization mode, either ``"zscore"`` or ``"none"``.
-        eps: Small epsilon used to avoid division by zero.
-        clip: Optional post-normalization clipping threshold.
-    """
-
     mode: str = "zscore"
     eps: float = 1e-6
     clip: Optional[float] = 6.0
 
-
-def _validate_accel_tensor(name: str, tensor: torch.Tensor) -> None:
-    """Validate acceleration tensor shape.
-
-    Args:
-        name: Tensor name for diagnostics.
-        tensor: Tensor expected to be ``[N, T, 3]``.
-    """
-    assert_rank(tensor, 3, name)
-    assert_last_dim(tensor, 3, name)
+    def __post_init__(self) -> None:
+        if self.mode not in ("zscore", "none"):
+            raise ValueError("NormalizationConfig.mode must be 'zscore' or 'none'")
 
 
-def _compute_zscore_stats(accel: torch.Tensor, eps: float) -> Dict[str, torch.Tensor]:
-    """Compute dataset-level per-axis z-score statistics.
-
-    Args:
-        accel: Acceleration tensor ``[N, T, 3]``.
-        eps: Minimum std clamp.
-
-    Returns:
-        Dictionary containing ``mean`` and ``std`` with shape ``[1, 1, 3]``.
-    """
-    mean = accel.mean(dim=(0, 1), keepdim=True)
-    std = accel.std(dim=(0, 1), keepdim=True).clamp_min(eps)
-    return {"mean": mean, "std": std}
+def _validate_skeleton_tensor(x: torch.Tensor) -> torch.Tensor:
+    if x is None:
+        raise ValueError("Skeleton tensor is required")
+    x = torch.as_tensor(x, dtype=torch.float32)
+    if x.ndim != 4:
+        raise ValueError(f"Skeleton tensor must be [N,T,J,3], got shape {tuple(x.shape)}")
+    if x.shape[-1] != 3:
+        raise ValueError(f"Skeleton tensor last dim must be 3, got shape {tuple(x.shape)}")
+    return x
 
 
-def _normalize_accel(
-    accel: torch.Tensor,
-    config: NormalizationConfig,
-    stats: Optional[Mapping[str, torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Normalize one acceleration stream.
-
-    Args:
-        accel: Input acceleration tensor ``[N, T, 3]``.
-        config: Normalization settings.
-        stats: Optional precomputed statistics with keys ``mean`` and ``std``.
-
-    Returns:
-        Tuple of normalized tensor and resolved stats dictionary.
-    """
-    if config.mode not in {"zscore", "none"}:
-        raise ValueError(f"Unsupported normalization mode: {config.mode}")
-
-    accel = accel.float()
-    if config.mode == "none":
-        resolved_stats = {
-            "mean": torch.zeros((1, 1, 3), dtype=accel.dtype),
-            "std": torch.ones((1, 1, 3), dtype=accel.dtype),
-        }
-        return accel, resolved_stats
-
-    if stats is not None and "mean" in stats and "std" in stats:
-        mean = torch.as_tensor(stats["mean"], dtype=accel.dtype)
-        std = torch.as_tensor(stats["std"], dtype=accel.dtype).clamp_min(config.eps)
-        if mean.shape != (1, 1, 3) or std.shape != (1, 1, 3):
-            raise AssertionError("Provided normalization stats must have shape [1, 1, 3]")
-        resolved_stats = {"mean": mean, "std": std}
-    else:
-        resolved_stats = _compute_zscore_stats(accel, config.eps)
-
-    normalized = (accel - resolved_stats["mean"]) / resolved_stats["std"]
-    if config.clip is not None:
-        normalized = normalized.clamp(-float(config.clip), float(config.clip))
-    return normalized, resolved_stats
+def _validate_accel_tensor(a: torch.Tensor, name: str) -> torch.Tensor:
+    if a is None:
+        raise ValueError(f"{name} tensor is required")
+    a = torch.as_tensor(a, dtype=torch.float32)
+    if a.ndim != 3 or a.shape[-1] != 3:
+        raise ValueError(f"{name} must be [N,T,3], got shape {tuple(a.shape)}")
+    return a
 
 
-def _resolve_sensor_pair(
-    accel_by_sensor: Mapping[str, torch.Tensor],
-    sensor_pair: Tuple[str, str],
+def _normalize_pair(
+    accel_primary: torch.Tensor,
+    accel_secondary: torch.Tensor,
+    normalization: NormalizationConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Resolve acceleration tensors from a named sensor dictionary.
+    if normalization.mode == "none":
+        return accel_primary, accel_secondary
 
-    Args:
-        accel_by_sensor: Mapping from sensor name to tensor ``[N, T, 3]``.
-        sensor_pair: Pair of sensor names to select.
-
-    Returns:
-        Selected pair of acceleration tensors.
-    """
-    sensor_a, sensor_b = sensor_pair
-    if sensor_a not in accel_by_sensor:
-        raise KeyError(f"Sensor '{sensor_a}' not present in accel_by_sensor")
-    if sensor_b not in accel_by_sensor:
-        raise KeyError(f"Sensor '{sensor_b}' not present in accel_by_sensor")
-    return accel_by_sensor[sensor_a], accel_by_sensor[sensor_b]
+    p_stats = compute_zscore_stats(accel_primary, eps=normalization.eps)
+    s_stats = compute_zscore_stats(accel_secondary, eps=normalization.eps)
+    accel_primary = normalize_accel(
+        accel_primary, p_stats, eps=normalization.eps, clip=normalization.clip
+    )
+    accel_secondary = normalize_accel(
+        accel_secondary, s_stats, eps=normalization.eps, clip=normalization.clip
+    )
+    return accel_primary, accel_secondary
 
 
-class SkeletonDataset(Dataset[Dict[str, torch.Tensor]]):
-    """Skeleton sequence dataset.
+class SkeletonDataset(Dataset):
+    """Simple tensor dataset for skeleton-only Stage 1 training."""
 
-    Returns per sample:
-        - ``X``: skeleton tensor with shape ``[T, J, 3]``
-        - ``y``: label scalar (or ``-1`` when unavailable)
-    """
-
-    def __init__(
-        self,
-        skeleton: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Initialize the skeleton dataset.
-
-        Args:
-            skeleton: Skeleton tensor ``[N, T, J, 3]``.
-            labels: Optional label tensor ``[N]``.
-        """
-        if skeleton is None:
-            raise ValueError("skeleton is required")
-
-        assert_rank(skeleton, 4, "skeleton")
-        assert_last_dim(skeleton, 3, "skeleton")
-        if labels is not None and labels.shape[0] != skeleton.shape[0]:
-            raise AssertionError("labels and skeleton must share the sample dimension")
-
-        self.skeleton = skeleton.float()
-        self.labels = labels.long() if labels is not None else None
+    def __init__(self, skeleton: torch.Tensor, labels: Optional[torch.Tensor] = None) -> None:
+        self.X = _validate_skeleton_tensor(skeleton)
+        if labels is None:
+            self.y = torch.full((self.X.shape[0],), -1, dtype=torch.long)
+        else:
+            labels = torch.as_tensor(labels, dtype=torch.long)
+            if labels.ndim != 1 or labels.shape[0] != self.X.shape[0]:
+                raise ValueError("labels must be [N] and align with skeleton batch size")
+            self.y = labels
 
     def __len__(self) -> int:
-        """Return dataset length."""
-        return int(self.skeleton.shape[0])
+        return self.X.shape[0]
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        """Get one skeleton sample.
-
-        Args:
-            index: Sample index.
-
-        Returns:
-            Dictionary with ``X`` and ``y``.
-        """
-        label = torch.tensor(-1, dtype=torch.long) if self.labels is None else self.labels[index]
-        return {"X": self.skeleton[index], "y": label}
+    def __getitem__(self, idx: int) -> dict:
+        return {"X": self.X[idx], "y": self.y[idx]}
 
 
-class IMUDataset(Dataset[Dict[str, torch.Tensor]]):
-    """Acceleration-only dataset with two configurable sensor streams.
-
-    Returns per sample:
-        - ``A1``: first acceleration sensor stream ``[T, 3]``
-        - ``A2``: second acceleration sensor stream ``[T, 3]``
-        - ``A_pair``: stacked acceleration pair ``[2, T, 3]``
-        - ``y``: label scalar (or ``-1`` when unavailable)
-    """
+class IMUDataset(Dataset):
+    """Simple tensor dataset for IMU-only generation/inference."""
 
     def __init__(
         self,
-        accel_primary: Optional[torch.Tensor] = None,
-        accel_secondary: Optional[torch.Tensor] = None,
-        accel_by_sensor: Optional[Mapping[str, torch.Tensor]] = None,
-        sensor_pair: Tuple[str, str] = ("meta_hip", "meta_wrist"),
+        accel_primary: torch.Tensor,
+        accel_secondary: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        sensor_pair: Tuple[str, str] = ("sensor1", "sensor2"),
         normalization: Optional[NormalizationConfig] = None,
-        normalization_stats: Optional[Mapping[str, Mapping[str, torch.Tensor]]] = None,
     ) -> None:
-        """Initialize two-sensor acceleration dataset.
-
-        Args:
-            accel_primary: Optional first acceleration tensor ``[N, T, 3]``.
-            accel_secondary: Optional second acceleration tensor ``[N, T, 3]``.
-            accel_by_sensor: Optional mapping of sensor names to tensors.
-            sensor_pair: Selected sensor names from ``accel_by_sensor``.
-            labels: Optional label tensor ``[N]``.
-            normalization: Normalization settings.
-            normalization_stats: Optional precomputed normalization stats.
-        """
-        norm_cfg = normalization or NormalizationConfig()
-
-        if accel_by_sensor is not None:
-            accel_primary, accel_secondary = _resolve_sensor_pair(accel_by_sensor, sensor_pair)
-
-        if accel_primary is None or accel_secondary is None:
-            raise ValueError("Both accel_primary and accel_secondary must be provided")
-
-        _validate_accel_tensor("accel_primary", accel_primary)
-        _validate_accel_tensor("accel_secondary", accel_secondary)
-        if accel_primary.shape != accel_secondary.shape:
-            raise AssertionError("accel_primary and accel_secondary shapes must match")
-        if labels is not None and labels.shape[0] != accel_primary.shape[0]:
-            raise AssertionError("labels and acceleration tensors must share the sample dimension")
-
         self.sensor_pair = sensor_pair
-        stats_input = normalization_stats or {}
-        primary_stats = stats_input.get(sensor_pair[0])
-        secondary_stats = stats_input.get(sensor_pair[1])
+        self.A1 = _validate_accel_tensor(accel_primary, "accel_primary")
+        self.A2 = _validate_accel_tensor(accel_secondary, "accel_secondary")
+        if self.A1.shape[:2] != self.A2.shape[:2]:
+            raise ValueError("accel_primary and accel_secondary must share [N,T]")
 
-        normalized_primary, resolved_primary_stats = _normalize_accel(accel_primary, norm_cfg, stats=primary_stats)
-        normalized_secondary, resolved_secondary_stats = _normalize_accel(accel_secondary, norm_cfg, stats=secondary_stats)
+        cfg = normalization or NormalizationConfig(mode="none")
+        self.A1, self.A2 = _normalize_pair(self.A1, self.A2, cfg)
 
-        self.accel_primary = normalized_primary
-        self.accel_secondary = normalized_secondary
-        self.labels = labels.long() if labels is not None else None
-        self.normalization_config = norm_cfg
-        self.normalization_stats: Dict[str, Dict[str, torch.Tensor]] = {
-            sensor_pair[0]: resolved_primary_stats,
-            sensor_pair[1]: resolved_secondary_stats,
-        }
+        if labels is None:
+            self.y = torch.full((self.A1.shape[0],), -1, dtype=torch.long)
+        else:
+            labels = torch.as_tensor(labels, dtype=torch.long)
+            if labels.ndim != 1 or labels.shape[0] != self.A1.shape[0]:
+                raise ValueError("labels must be [N] and align with accel batch size")
+            self.y = labels
 
     def __len__(self) -> int:
-        """Return dataset length."""
-        return int(self.accel_primary.shape[0])
+        return self.A1.shape[0]
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        """Get one acceleration sample.
-
-        Args:
-            index: Sample index.
-
-        Returns:
-            Dictionary with ``A1``, ``A2``, ``A_pair``, and ``y``.
-        """
-        a1 = self.accel_primary[index]
-        a2 = self.accel_secondary[index]
-        label = torch.tensor(-1, dtype=torch.long) if self.labels is None else self.labels[index]
+    def __getitem__(self, idx: int) -> dict:
+        a1 = self.A1[idx]
+        a2 = self.A2[idx]
         return {
             "A1": a1,
             "A2": a2,
             "A_pair": torch.stack([a1, a2], dim=0),
-            "y": label,
+            "y": self.y[idx],
         }
 
-    def get_normalization_stats(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Return a copy of normalization stats for both sensors.
 
-        Returns:
-            Sensor-keyed dictionary with ``mean`` and ``std`` tensors.
-        """
-        stats: Dict[str, Dict[str, torch.Tensor]] = {}
-        for sensor_name, sensor_stats in self.normalization_stats.items():
-            stats[sensor_name] = {
-                "mean": sensor_stats["mean"].clone(),
-                "std": sensor_stats["std"].clone(),
-            }
-        return stats
-
-
-class PairedDataset(Dataset[Dict[str, torch.Tensor]]):
-    """Paired skeleton and acceleration-only dataset.
-
-    Returns per sample:
-        - ``X``: skeleton ``[T, J, 3]``
-        - ``A1``: first acceleration stream ``[T, 3]``
-        - ``A2``: second acceleration stream ``[T, 3]``
-        - ``A_pair``: stacked acceleration pair ``[2, T, 3]``
-        - ``y``: label scalar (or ``-1`` when unavailable)
-    """
+class PairedDataset(Dataset):
+    """Simple tensor dataset for Stage 2/3 paired skeleton+IMU training."""
 
     def __init__(
         self,
-        skeleton: Optional[torch.Tensor] = None,
-        accel_primary: Optional[torch.Tensor] = None,
-        accel_secondary: Optional[torch.Tensor] = None,
-        accel_by_sensor: Optional[Mapping[str, torch.Tensor]] = None,
-        sensor_pair: Tuple[str, str] = ("meta_hip", "meta_wrist"),
+        skeleton: torch.Tensor,
+        accel_primary: torch.Tensor,
+        accel_secondary: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        sensor_pair: Tuple[str, str] = ("sensor1", "sensor2"),
         normalization: Optional[NormalizationConfig] = None,
-        normalization_stats: Optional[Mapping[str, Mapping[str, torch.Tensor]]] = None,
     ) -> None:
-        """Initialize paired skeleton and acceleration dataset.
-
-        Args:
-            skeleton: Optional skeleton tensor ``[N, T, J, 3]``.
-            accel_primary: Optional first acceleration tensor ``[N, T, 3]``.
-            accel_secondary: Optional second acceleration tensor ``[N, T, 3]``.
-            accel_by_sensor: Optional sensor-name mapping for accelerations.
-            sensor_pair: Selected pair from ``accel_by_sensor``.
-            labels: Optional label tensor ``[N]``.
-            normalization: Normalization settings.
-            normalization_stats: Optional precomputed normalization stats.
-        """
-        norm_cfg = normalization or NormalizationConfig()
-
-        if accel_by_sensor is not None:
-            accel_primary, accel_secondary = _resolve_sensor_pair(accel_by_sensor, sensor_pair)
-
-        if skeleton is None or accel_primary is None or accel_secondary is None:
-            raise ValueError("skeleton, accel_primary, and accel_secondary are required")
-
-        assert_rank(skeleton, 4, "skeleton")
-        assert_last_dim(skeleton, 3, "skeleton")
-        _validate_accel_tensor("accel_primary", accel_primary)
-        _validate_accel_tensor("accel_secondary", accel_secondary)
-
-        if accel_primary.shape != accel_secondary.shape:
-            raise AssertionError("accel_primary and accel_secondary shapes must match")
-        if skeleton.shape[0] != accel_primary.shape[0] or skeleton.shape[1] != accel_primary.shape[1]:
-            raise AssertionError("skeleton and acceleration streams must match on [N, T]")
-        if labels is not None and labels.shape[0] != skeleton.shape[0]:
-            raise AssertionError("labels and paired tensors must share sample dimension")
-
-        self.skeleton = skeleton.float()
         self.sensor_pair = sensor_pair
-        stats_input = normalization_stats or {}
-        primary_stats = stats_input.get(sensor_pair[0])
-        secondary_stats = stats_input.get(sensor_pair[1])
+        self.X = _validate_skeleton_tensor(skeleton)
+        self.A1 = _validate_accel_tensor(accel_primary, "accel_primary")
+        self.A2 = _validate_accel_tensor(accel_secondary, "accel_secondary")
 
-        normalized_primary, resolved_primary_stats = _normalize_accel(accel_primary, norm_cfg, stats=primary_stats)
-        normalized_secondary, resolved_secondary_stats = _normalize_accel(accel_secondary, norm_cfg, stats=secondary_stats)
+        if self.X.shape[0] != self.A1.shape[0] or self.A1.shape != self.A2.shape:
+            raise ValueError("skeleton/accel tensors must align on sample count and accel shape")
+        if self.X.shape[1] != self.A1.shape[1]:
+            raise ValueError("skeleton and accel sequence length T must match")
 
-        self.accel_primary = normalized_primary
-        self.accel_secondary = normalized_secondary
-        self.labels = labels.long() if labels is not None else None
-        self.normalization_config = norm_cfg
-        self.normalization_stats: Dict[str, Dict[str, torch.Tensor]] = {
-            sensor_pair[0]: resolved_primary_stats,
-            sensor_pair[1]: resolved_secondary_stats,
-        }
+        cfg = normalization or NormalizationConfig(mode="none")
+        self.A1, self.A2 = _normalize_pair(self.A1, self.A2, cfg)
+
+        if labels is None:
+            self.y = torch.full((self.X.shape[0],), -1, dtype=torch.long)
+        else:
+            labels = torch.as_tensor(labels, dtype=torch.long)
+            if labels.ndim != 1 or labels.shape[0] != self.X.shape[0]:
+                raise ValueError("labels must be [N] and align with sample count")
+            self.y = labels
 
     def __len__(self) -> int:
-        """Return dataset length."""
-        return int(self.skeleton.shape[0])
+        return self.X.shape[0]
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        """Get one paired sample.
-
-        Args:
-            index: Sample index.
-
-        Returns:
-            Dictionary with ``X``, ``A1``, ``A2``, ``A_pair``, and ``y``.
-        """
-        a1 = self.accel_primary[index]
-        a2 = self.accel_secondary[index]
-        label = torch.tensor(-1, dtype=torch.long) if self.labels is None else self.labels[index]
+    def __getitem__(self, idx: int) -> dict:
+        a1 = self.A1[idx]
+        a2 = self.A2[idx]
         return {
-            "X": self.skeleton[index],
+            "X": self.X[idx],
             "A1": a1,
             "A2": a2,
             "A_pair": torch.stack([a1, a2], dim=0),
-            "y": label,
+            "y": self.y[idx],
         }
-
-    def get_normalization_stats(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Return a copy of normalization stats for both acceleration sensors.
-
-        Returns:
-            Sensor-keyed dictionary with ``mean`` and ``std`` tensors.
-        """
-        stats: Dict[str, Dict[str, torch.Tensor]] = {}
-        for sensor_name, sensor_stats in self.normalization_stats.items():
-            stats[sensor_name] = {
-                "mean": sensor_stats["mean"].clone(),
-                "std": sensor_stats["std"].clone(),
-            }
-        return stats
