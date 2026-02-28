@@ -15,6 +15,19 @@
 # We will create windows of length T (example: 90 frames)
 # so the model always sees the same size input.
 # ============================================================
+#One critical behavioral detail (you should be aware of)
+
+# Every window in a fall trial is labeled as “fall” (1) even if the fall happens only near the end.
+
+# That means your “fall” class contains:
+
+# pre-fall walking
+
+# destabilization
+
+# impact/post-fall
+
+# If you later train a classifier or condition on y, the signal can be noisy unless your method is trial-level on purpose.
 
 import os               # lets us look inside folders and list files
 import re               # lets us find patterns like "A10" inside filenames
@@ -315,6 +328,7 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
         stride: int = 30,
         fall_activities=(10, 11, 12, 13, 14),
         drop_misaligned: bool = True,
+        align_mode: str = "strict",
 
         # Filter which files/subjects to use (helps subject-wise split)
         allowed_files: list[str] | None = None,
@@ -341,6 +355,9 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
 
         # if True, skip trials where row counts mismatch
         self.drop_misaligned = bool(drop_misaligned)
+        self.align_mode = str(align_mode).lower()
+        if self.align_mode not in ("strict", "truncate_min"):
+            raise ValueError("align_mode must be 'strict' or 'truncate_min'")
 
         # store IMU normalization settings
         self.imu_normalization = imu_normalization
@@ -398,17 +415,16 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
             n1 = len(s1_df)
             n2 = len(s2_df)
 
-            # if frame counts do not match, either skip or error
-            if not (n0 == n1 == n2):
-                if self.drop_misaligned:
-                    continue
-                raise ValueError(f"Frame mismatch {fname}: skel={n0}, s1={n1}, s2={n2}")
-
-            # label from filename (0 or 1)
-            y = label_from_filename_binary(fname, fall_activities=self.fall_activities)
-
-            # how many frames in this trial
-            n_frames = n0
+            if self.align_mode == "strict":
+                # strict mode expects equal sequence length
+                if not (n0 == n1 == n2):
+                    if self.drop_misaligned:
+                        continue
+                    raise ValueError(f"Frame mismatch {fname}: skel={n0}, s1={n1}, s2={n2}")
+                n_frames = n0
+            else:
+                # truncate mode uses overlapping frames across modalities
+                n_frames = min(n0, n1, n2)
 
             # window length
             T = self.window_size
@@ -419,6 +435,9 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
             # if trial is shorter than one window, skip
             if n_frames < T:
                 continue
+
+            # label from filename (0 or 1)
+            y = label_from_filename_binary(fname, fall_activities=self.fall_activities)
 
             # number of windows we can slide through
             num_windows = (n_frames - T) // step + 1

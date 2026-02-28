@@ -22,6 +22,14 @@ This Stage3Model supports:
 - h=None (unconditional)
 - h=[B,T,D]  (sequence conditioning)
 - h=[B,T,J,D] (joint conditioning)
+
+One important caution (not “wrong”, but you should know)
+
+In your forward pass, classification is performed on:
+
+x_hat decoded from z0_est computed from a single random timestep t
+
+That means classifier is learning on reconstructions coming from various noise levels (indirectly). This can be good regularization, but if you intended classification on clean decoded latents, you’d instead decode z0_target (or decode fully sampled z0). Your current design is valid—just a design choice.
 """
 
 from __future__ import annotations

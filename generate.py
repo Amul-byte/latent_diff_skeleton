@@ -1,443 +1,290 @@
-"""
-generate_csv_to_gif.py
-
-Generate decoded skeletons (x_hat) + GIFs from two IMU CSV folders.
-
-Uses your existing checkpoints:
-  - smoke_stage1.pt  (Stage1: decoder)
-  - smoke_stage2*.pt (Stage2: sensor encoder)
-  - smoke_stage3*.pt (Stage3: denoiser)
-
-Output:
-  - outputs/generated_decoded.pt   (small, only a few samples)
-  - outputs/gifs/*.gif
-
-IMPORTANT:
-- This script assumes your repo has these classes:
-    from diffusion_model.sensor_model import TwoSensorIMUEncoder
-    from diffusion_model.skeleton_model import SkeletonStage1Model
-    from diffusion_model.model import GraphDenoiserMasked
-  If class names differ in your repo, change the imports only.
-"""
-
-from __future__ import annotations
-
+#!/usr/bin/env python3
 import os
-import glob
-import argparse
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Any
-
-import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+import argparse
+import imageio
+import random
+import inspect
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
-# -------------------------
-# EDIT ONLY IF YOUR CLASS NAMES DIFFER
-# -------------------------
-from diffusion_model.sensor_model import TwoSensorIMUEncoder
-from diffusion_model.skeleton_model import SkeletonStage1Model
-from diffusion_model.model import GraphDenoiserMasked
+from diffusion_model.model import Stage3Model
+from diffusion_model.sensor_model import SensorTGNNEncoder
+from diffusion_model.model_loader import load_checkpoint
+from diffusion_model.util import build_chain_adjacency, resolve_device, set_seed
 
 
-# -------------------------
-# Utils
-# -------------------------
-def set_seed(seed: int) -> None:
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
+def set_seed_local(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-def safe_torch_load(path: str, map_location="cpu"):
-    # Silences the "weights_only" warning on newer torch, while staying compatible with older torch.
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)  # type: ignore
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
-def safe_read_csv_last3(path: str) -> np.ndarray:
-    """Robust CSV -> float32 [T,3] (uses last 3 columns)."""
-    try:
-        df = pd.read_csv(path, header=None)
-    except pd.errors.EmptyDataError:
-        raise ValueError(f"Empty CSV: {path}")
-    except Exception as e:
-        raise ValueError(f"Failed to read {path}: {e}")
-
-    arr = df.to_numpy()
-    if arr.size == 0:
-        raise ValueError(f"No data in CSV: {path}")
-
-    arr = pd.DataFrame(arr).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
-    if arr.ndim != 2 or arr.shape[1] < 3:
-        raise ValueError(f"Expected >=3 cols in {path}, got {arr.shape}")
-
-    arr = arr[:, -3:]  # last 3 accel cols
-    arr[np.isinf(arr)] = np.nan
-
-    col_mean = np.nanmean(arr, axis=0)
-    col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
-    nan_mask = np.isnan(arr)
-    arr[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])
-
-    return arr.astype(np.float32)
-
-
-def zscore_per_channel(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    mu = x.mean(axis=0, keepdims=True)
-    sd = x.std(axis=0, keepdims=True)
-    return (x - mu) / (sd + eps)
-
-
-def build_chain_adjacency(num_joints: int, device: torch.device, include_self: bool = True) -> torch.Tensor:
-    """Simple chain adjacency [J,J]. Good enough for forward() signature requirements."""
-    A = torch.zeros((num_joints, num_joints), device=device, dtype=torch.float32)
-    for j in range(num_joints - 1):
-        A[j, j + 1] = 1.0
-        A[j + 1, j] = 1.0
-    if include_self:
-        A.fill_diagonal_(1.0)
-    return A
-
-
-# -------------------------
-# Dataset: paired windows
-# -------------------------
-class PairedIMUWindowDataset(Dataset):
-    def __init__(
-        self,
-        imu_dir1: str,
-        imu_dir2: str,
-        window: int = 90,
-        stride: int = 30,
-        normalize: str = "zscore",
-        max_files: Optional[int] = None,
-    ):
-        self.window = window
-        self.stride = stride
-        self.normalize = normalize
-
-        f1 = sorted(glob.glob(os.path.join(imu_dir1, "*.csv")))
-        f2 = sorted(glob.glob(os.path.join(imu_dir2, "*.csv")))
-        if not f1:
-            raise FileNotFoundError(f"No CSVs in imu_dir1: {imu_dir1}")
-        if not f2:
-            raise FileNotFoundError(f"No CSVs in imu_dir2: {imu_dir2}")
-
-        m2 = {os.path.basename(p): p for p in f2}
-        pairs = [(p, m2[os.path.basename(p)]) for p in f1 if os.path.basename(p) in m2]
-        if not pairs:
-            raise ValueError("No matching basenames between imu_dir1 and imu_dir2")
-
-        if max_files is not None:
-            pairs = pairs[:max_files]
-        self.pairs = pairs
-
-        self.cache_A1: List[np.ndarray] = []
-        self.cache_A2: List[np.ndarray] = []
-        self.file_names: List[str] = []
-        self.index: List[Tuple[int, int]] = []  # (fi, start)
-
-        for (p1, p2) in tqdm(self.pairs, desc="Loading IMU CSVs"):
-            fname = os.path.basename(p1)
-            try:
-                A1 = safe_read_csv_last3(p1)
-                A2 = safe_read_csv_last3(p2)
-            except Exception as e:
-                print(f"[skip] {fname}: {e}")
-                continue
-
-            T = min(len(A1), len(A2))
-            if T < window:
-                print(f"[skip] {fname}: too short T={T} < window={window}")
-                continue
-
-            A1 = A1[:T]
-            A2 = A2[:T]
-
-            if normalize == "zscore":
-                A1 = zscore_per_channel(A1)
-                A2 = zscore_per_channel(A2)
-            elif normalize == "none":
-                pass
-            else:
-                raise ValueError("normalize must be zscore or none")
-
-            self.cache_A1.append(A1)
-            self.cache_A2.append(A2)
-            self.file_names.append(fname)
-
-            fi = len(self.cache_A1) - 1
-            for start in range(0, T - window + 1, stride):
-                self.index.append((fi, start))
-
-        if not self.index:
-            raise ValueError("No windows created. Check window/stride and data lengths.")
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        fi, start = self.index[idx]
-        A1 = self.cache_A1[fi][start : start + self.window]
-        A2 = self.cache_A2[fi][start : start + self.window]
-        return {
-            "A1": torch.from_numpy(A1).float(),  # [W,3]
-            "A2": torch.from_numpy(A2).float(),  # [W,3]
-            "file": self.file_names[fi],
-            "start": torch.tensor(start, dtype=torch.long),
-        }
-
-
-# -------------------------
-# DDPM sampler in latent space
-# -------------------------
-class DDPM:
-    def __init__(self, T: int, beta_start: float, beta_end: float, device: torch.device):
-        self.T = T
-        self.device = device
-        self.betas = torch.linspace(beta_start, beta_end, T, device=device)
-        self.alphas = 1.0 - self.betas
-        self.abar = torch.cumprod(self.alphas, dim=0)
-
-    @torch.no_grad()
-    def sample(self, eps_fn, shape: Tuple[int, ...], steps: int) -> torch.Tensor:
-        x = torch.randn(shape, device=self.device)
-
-        # uniform subsampling of timesteps
-        idx = torch.linspace(0, self.T - 1, steps).long().tolist()
-        timesteps = list(reversed(idx))
-
-        for t in timesteps:
-            t_batch = torch.full((shape[0],), t, device=self.device, dtype=torch.long)
-            eps = eps_fn(x, t_batch)
-
-            beta_t = self.betas[t]
-            alpha_t = self.alphas[t]
-            abar_t = self.abar[t]
-
-            mu = (1.0 / torch.sqrt(alpha_t)) * (x - (beta_t / torch.sqrt(1.0 - abar_t)) * eps)
-
-            if t > 0:
-                x = mu + torch.sqrt(beta_t) * torch.randn_like(x)
-            else:
-                x = mu
-
+def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """
+    x: [B,T,3] -> [B,target_len,3] (linear interpolation)
+    Needed because IMU is 50Hz and skeleton is 30Hz.
+    """
+    if x.shape[1] == target_len:
         return x
 
+    # interpolate expects [B,C,T]
+    x_bct = x.transpose(1, 2)  # [B,3,T]
+    x_rs = torch.nn.functional.interpolate(x_bct, size=target_len, mode="linear", align_corners=False)
+    return x_rs.transpose(1, 2)  # [B,target_len,3]
 
-# -------------------------
-# GIF rendering (simple XY projection)
-# -------------------------
-def save_gif_xy(points_wj3: np.ndarray, out_gif: Path, fps: int = 15) -> None:
-    """
-    points_wj3: [W,J,3]
-    Saves a 2D XY scatter GIF.
-    """
-    import matplotlib.pyplot as plt
-    import imageio.v2 as imageio
 
-    W, J, _ = points_wj3.shape
+def visualize_skeleton(positions, save_path='skeleton_animation.gif'):
+    # SAME pattern as your example: expects positions [B, T, D]
+    # Your Stage3 outputs [B,T,J,3], so we convert before calling this.
+    connections = [
+        (0, 1),
+        (1, 2), (2, 3), (3, 4),
+        (1, 5), (5, 6), (6, 7),
+        (1, 8), (8, 9),
+        (9, 10), (10, 11), (11, 12),
+        (9, 13), (13, 14), (14, 15)
+    ]
+
     frames = []
+    sample_idx = 0
 
-    # autoscale
-    xs = points_wj3[..., 0]
-    ys = points_wj3[..., 1]
-    xmin, xmax = float(xs.min()), float(xs.max())
-    ymin, ymax = float(ys.min()), float(ys.max())
+    num_frames = positions.shape[1]
+    for frame_idx in range(num_frames):
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
 
-    for t in range(W):
-        fig = plt.figure(figsize=(4, 4), dpi=120)
-        ax = fig.add_subplot(111)
-        ax.scatter(points_wj3[t, :, 0], points_wj3[t, :, 1], s=12)
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_title(f"t={t}")
-        ax.axis("off")
+        ax.set_facecolor('white')
+        ax.grid(False)
+        ax.set_axis_off()
 
+        for joint1, joint2 in connections:
+            joint1_coords = positions[sample_idx, frame_idx, joint1 * 3:(joint1 * 3) + 3]
+            joint2_coords = positions[sample_idx, frame_idx, joint2 * 3:(joint2 * 3) + 3]
+            if len(joint1_coords) < 3 or len(joint2_coords) < 3:
+                continue
+
+            xs = [joint1_coords[0], joint2_coords[0]]
+            ys = [joint1_coords[1], joint2_coords[1]]
+            zs = [joint1_coords[2], joint2_coords[2]]
+
+            ax.plot(xs, ys, zs, marker='o', color='darkblue')
+            ax.scatter(joint1_coords[0], joint1_coords[1], joint1_coords[2], color='red', s=50)
+            ax.scatter(joint2_coords[0], joint2_coords[1], joint2_coords[2], color='red', s=50)
+
+        ax.set_box_aspect([1, 1, 1])
+        ax.view_init(elev=-90, azim=-90)
+
+        plt.tight_layout()
         fig.canvas.draw()
-        # img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        # draw the canvas first
 
-        # Robust: works on newer Matplotlib (preferred)
+        # robust replacement for tostring_rgb (your env sometimes errors)
         if hasattr(fig.canvas, "buffer_rgba"):
-            img = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)  # (H,W,4)
-            img = img[..., :3]  # drop alpha -> (H,W,3)
-
-        # Fallback: older Matplotlib using ARGB bytes
+            buf = np.asarray(fig.canvas.buffer_rgba())
+            image = buf[..., :3].copy()
         else:
-            w, h = fig.canvas.get_width_height()
-            buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8).reshape(h, w, 4)
-            img = buf[..., [1, 2, 3]]  # ARGB -> RGB
-        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        frames.append(img)
+            image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+            image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+        frames.append(image)
         plt.close(fig)
 
-    out_gif.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimsave(str(out_gif), frames, fps=fps)
+    out_dir = os.path.dirname(save_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    imageio.mimsave(save_path, frames, duration=0.2)
+    print(f'GIF saved as {save_path}')
 
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--imu_dir1", type=str, required=True)
-    p.add_argument("--imu_dir2", type=str, required=True)
+def check_for_nans(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"NaNs detected in {name}")
+    else:
+        print(f"No NaNs in {name}")
 
-    p.add_argument("--stage1_ckpt", type=str, default="checkpoints/smoke_stage1.pt")
-    p.add_argument("--stage2_ckpt", type=str, default="checkpoints/smoke_stage2_accel_only.pt")
-    p.add_argument("--stage3_ckpt", type=str, default="checkpoints/smoke_stage3_accel_only.pt")
 
-    p.add_argument("--window", type=int, default=90)
-    p.add_argument("--stride", type=int, default=30)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--normalize", type=str, default="zscore", choices=["zscore", "none"])
-    p.add_argument("--max_files", type=int, default=30, help="limit files for generation (prevents huge outputs)")
+def generate_samples(args, sensor_model, diffusion_model, device):
+    # === SAME PATTERN ===
+    # dataset -> dataloader -> take one batch -> context -> generate -> return samples
 
-    p.add_argument("--num_joints", type=int, default=32)
-    p.add_argument("--latent_dim", type=int, default=256)
-    p.add_argument("--hidden_dim", type=int, default=256)
+    from diffusion_model.dataset import SmartFallPairedSlidingWindowDataset, read_csv_files
 
-    p.add_argument("--T", type=int, default=1000)
-    p.add_argument("--sampling_steps", type=int, default=200)
-    p.add_argument("--beta_start", type=float, default=1e-4)
-    p.add_argument("--beta_end", type=float, default=2e-2)
+    skeleton_data = read_csv_files(args.skeleton_folder)
+    sensor1_data = read_csv_files(args.sensor_folder1)
+    sensor2_data = read_csv_files(args.sensor_folder2)
 
-    p.add_argument("--out_pt", type=str, default="outputs/generated_decoded.pt")
-    p.add_argument("--gif_dir", type=str, default="outputs/gifs")
-    p.add_argument("--num_gifs", type=int, default=10, help="how many windows to export as GIF")
-    p.add_argument("--gif_fps", type=int, default=15)
-
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
-
-    set_seed(args.seed)
-    device = torch.device(args.device)
-
-    ds = PairedIMUWindowDataset(
-        imu_dir1=args.imu_dir1,
-        imu_dir2=args.imu_dir2,
-        window=args.window,
-        stride=args.stride,
-        normalize=args.normalize,
-        max_files=args.max_files,
+    ds_kwargs = dict(
+        skeleton_data=skeleton_data,
+        sensor1_data=sensor1_data,
+        sensor2_data=sensor2_data,
+        window_size=args.window_size,
+        stride=args.window_stride,
+        fall_activities=tuple(args.fall_activities),
+        drop_misaligned=args.drop_misaligned,
+        imu_normalization=args.imu_norm,
+        imu_stats=None,
+        imu_eps=args.imu_eps,
+        imu_clip=args.imu_clip,
+        sensor_names=("sensor1", "sensor2"),
     )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    if "align_mode" in inspect.signature(SmartFallPairedSlidingWindowDataset.__init__).parameters:
+        ds_kwargs["align_mode"] = args.align_mode
+    dataset = SmartFallPairedSlidingWindowDataset(**ds_kwargs)
 
-    # ---- Load Stage1 (decoder) ----
-    stage1 = SkeletonStage1Model(
-        joint_dim=3,
+    if len(dataset) == 0:
+        raise ValueError("Dataset has zero windows for generation. Try --align_mode truncate_min and/or smaller --window_size.")
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+
+    generated_samples = []
+    sensor_model.eval()
+    diffusion_model.eval()
+
+    with torch.no_grad():
+        batch = next(iter(dataloader))
+
+        # Expect your PairedDataset returns dict (your codebase style)
+        # batch["A1"] [B,T,3], batch["A2"] [B,T,3], batch["y"] [B]
+        if isinstance(batch, dict):
+            sensor1 = batch["A1"]
+            sensor2 = batch["A2"]
+            label_index = batch.get("y", None)
+        else:
+            # if your dataset returns tuples, map them here
+            # (skeleton, sensor1, sensor2, label)
+            _, sensor1, sensor2, label_index = batch
+
+        sensor1 = sensor1.to(device)
+        sensor2 = sensor2.to(device)
+
+        # label handling same as your pattern
+        if label_index is None:
+            label_index = torch.zeros((sensor1.shape[0],), dtype=torch.long, device=device)
+        else:
+            label_index = label_index.to(device)
+            if label_index.ndim == 2:
+                label_index = torch.argmax(label_index, dim=1)
+            else:
+                label_index = label_index.long()
+
+        # --- FIX: resample IMU to match window_size (IMU 50Hz vs skeleton 30Hz) ---
+        sensor1 = _resample_to_len(sensor1, args.window_size)
+        sensor2 = _resample_to_len(sensor2, args.window_size)
+
+        # context (h) from your IMU encoder
+        h_joint, _h_seq = sensor_model(sensor1, sensor2)  # h_joint [B,T,J,D]
+        check_for_nans(h_joint, "context(h_joint)")
+
+        # Generate latent using your diffusion model (Stage3Model)
+        # This is the equivalent of diffusion_process.generate(...) in your sample
+        adjacency = build_chain_adjacency(num_joints=diffusion_model.num_joints, include_self=True, device=device)
+
+        batch_n = sensor1.shape[0]
+        z0_hat = diffusion_model.sample_latent(
+            batch_size=batch_n,
+            window=args.window_size,
+            adjacency=adjacency,
+            device=device,
+            h=h_joint,
+            steps=args.timesteps,
+        )
+        check_for_nans(z0_hat, "generated_latent(z0_hat)")
+
+        # Decode to skeleton coords: [B,T,J,3]
+        x_hat = diffusion_model.decode(z0_hat, adjacency)
+        check_for_nans(x_hat, "generated_sample(x_hat)")
+
+        generated_samples.append(x_hat.cpu())
+
+    generated_samples = torch.cat(generated_samples, dim=0)  # [B,T,J,3]
+    return generated_samples
+
+
+def main(args):
+    set_seed_local(args.seed)
+    device = resolve_device(args.device)
+
+    # === Load models (same pattern) ===
+    sensor_model = SensorTGNNEncoder(
         latent_dim=args.latent_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=3,
-        num_heads=8,
-        diffusion_steps=args.T,
+        num_joints=args.num_joints,
+        hidden_dim=args.imu_hidden_dim,
     ).to(device)
 
-    ckpt1 = safe_torch_load(args.stage1_ckpt, map_location="cpu")
-    # Accept common checkpoint formats
-    if isinstance(ckpt1, dict) and "decoder" in ckpt1:
-        stage1.decoder.load_state_dict(ckpt1["decoder"], strict=False)
-    else:
-        # fallback: try loading entire dict into stage1 (strict=False)
-        stage1.load_state_dict(ckpt1 if isinstance(ckpt1, dict) else ckpt1, strict=False)
+    if args.sensor_ckpt is not None:
+        load_checkpoint(args.sensor_ckpt, sensor_model, strict=False, map_location=device)
 
-    stage1.eval()
+    diffusion_model = Stage3Model(
+        latent_dim=args.latent_dim,
+        num_joints=args.num_joints,
+        num_classes=args.num_classes,
+        diffusion_steps=args.diffusion_steps,
+        window=args.window_size,
+    ).to(device)
 
-    # ---- Load Stage2 (sensor encoder) ----
-    sensor = TwoSensorIMUEncoder(latent_dim=args.latent_dim, hidden_dim=args.hidden_dim).to(device)
-    ckpt2 = safe_torch_load(args.stage2_ckpt, map_location="cpu")
-    sensor.load_state_dict(ckpt2 if isinstance(ckpt2, dict) else ckpt2, strict=False)
-    sensor.eval()
+    load_checkpoint(args.stage3_ckpt, diffusion_model, strict=False, map_location=device)
 
-    # ---- Load Stage3 (denoiser) ----
-    denoiser = GraphDenoiserMasked(latent_dim=args.latent_dim, hidden_dim=args.hidden_dim).to(device)
-    ckpt3 = safe_torch_load(args.stage3_ckpt, map_location="cpu")
-    denoiser.load_state_dict(ckpt3 if isinstance(ckpt3, dict) else ckpt3, strict=False)
-    denoiser.eval()
+    # === Generate samples ===
+    print("Generating samples based on sensor inputs...")
+    generated_samples = generate_samples(args, sensor_model, diffusion_model, device)
 
-    adjacency = build_chain_adjacency(args.num_joints, device=device, include_self=True)
+    # Convert [B,T,J,3] -> [B,T,J*3] to match your visualize_skeleton() exactly
+    B, T, J, D = generated_samples.shape
+    flat = generated_samples.numpy().reshape(B, T, J * D)
 
-    ddpm = DDPM(T=args.T, beta_start=args.beta_start, beta_end=args.beta_end, device=device)
-
-    out_items: List[Dict[str, Any]] = []
-    gif_dir = Path(args.gif_dir)
-    gif_dir.mkdir(parents=True, exist_ok=True)
-
-    made_gifs = 0
-
-    for batch in tqdm(loader, desc="Generating+Decoding"):
-        A1 = batch["A1"].to(device)  # [B,W,3]
-        A2 = batch["A2"].to(device)
-        B = A1.shape[0]
-
-        with torch.no_grad():
-            cond_out = sensor(A1, A2)
-            # handle sensor returning (h_joint, h_seq)
-            if isinstance(cond_out, tuple):
-                h_joint, h_seq = cond_out
-                cond = h_joint if (isinstance(h_joint, torch.Tensor) and h_joint.ndim >= 3) else h_seq
-            else:
-                cond = cond_out
-
-            def eps_fn(z_t: torch.Tensor, t_batch: torch.Tensor) -> torch.Tensor:
-                # GraphDenoiserMasked expects adjacency as 3rd arg.
-                # conditioning should be passed after that (usually named "context").
-                try:
-                    eps = denoiser(z_t, t_batch, adjacency, cond)     # <-- SWAP HERE
-                except TypeError:
-                    eps = denoiser(z_t, t_batch, adjacency, context=cond)  # <-- common keyword
-                if isinstance(eps, tuple):
-                    eps = eps[0]
-                return eps
-
-            # Sample latent z0 [B,W,J,D]
-            z0 = ddpm.sample(
-                eps_fn=eps_fn,
-                shape=(B, args.window, args.num_joints, args.latent_dim),
-                steps=args.sampling_steps,
-            )
-
-            # Decode to coords x_hat [B,W,J,3]
-            # Stage1 decoder signature differs across repos; try common patterns:
-            try:
-                x_hat = stage1.decoder(z0, adjacency)
-            except Exception:
-                x_hat = stage1.decoder(z0)
-
-        # save a SMALL pt: store x_hat only (float16) + minimal metadata
-        for i in range(B):
-            item = {
-                "file": batch["file"][i],
-                "start": int(batch["start"][i].item()),
-                "x_hat": x_hat[i].detach().cpu().to(torch.float16),  # [W,J,3]
-            }
-            out_items.append(item)
-
-            # make gifs for first N windows
-            if made_gifs < args.num_gifs:
-                pts = item["x_hat"].to(torch.float32).numpy()  # [W,J,3]
-                gif_path = gif_dir / (batch["file"][i].replace(".csv", f"_start{item['start']}.gif"))
-                save_gif_xy(pts, gif_path, fps=args.gif_fps)
-                made_gifs += 1
-
-    out_path = Path(args.out_pt)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(out_items, out_path)
-
-    print(f"\nSaved decoded windows (x_hat) to: {out_path}")
-    print(f"Saved {made_gifs} GIFs to: {gif_dir}")
+    visualize_skeleton(
+        flat,
+        save_path=args.out_gif
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate Skeleton GIF (your codebase, same pattern)")
+
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default=None)
+
+    # checkpoints
+    parser.add_argument("--stage3_ckpt", type=str, required=True)
+    parser.add_argument("--sensor_ckpt", type=str, default=None)
+
+    # dataset paths (same style as your sample)
+    parser.add_argument("--sensor_folder1", type=str, required=True)
+    parser.add_argument("--sensor_folder2", type=str, required=True)
+    parser.add_argument("--skeleton_folder", type=str, required=True)
+
+    # generation params
+    parser.add_argument("--window_size", type=int, default=90)
+    parser.add_argument("--window_stride", type=int, default=90)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--timesteps", type=int, default=None, help="sampling steps (<= diffusion_steps); None uses full")
+    parser.add_argument(
+        "--align_mode",
+        type=str,
+        default="truncate_min",
+        choices=["strict", "truncate_min"],
+        help="strict: require equal sequence lengths; truncate_min: use overlap across modalities",
+    )
+    parser.add_argument("--drop_misaligned", action="store_true", help="Only used with align_mode=strict")
+    parser.set_defaults(drop_misaligned=False)
+    parser.add_argument("--fall_activities", type=int, nargs="+", default=[10, 11, 12, 13, 14])
+    parser.add_argument("--imu_norm", type=str, default="none", choices=["none", "zscore"])
+    parser.add_argument("--imu_eps", type=float, default=1e-6)
+    parser.add_argument("--imu_clip", type=float, default=6.0)
+
+    # model params (must match how you trained Stage3)
+    parser.add_argument("--latent_dim", type=int, default=256)
+    parser.add_argument("--num_joints", type=int, default=32)
+    parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--diffusion_steps", type=int, default=500)
+    parser.add_argument("--imu_hidden_dim", type=int, default=256)
+
+    # output
+    parser.add_argument("--out_gif", type=str, default="./gif_tl/generated.gif")
+
+    args = parser.parse_args()
+    main(args)

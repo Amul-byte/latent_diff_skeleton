@@ -85,7 +85,7 @@ class LatentDiffusion(nn.Module):
 
     def __init__(
         self,
-        num_steps: int = 500,       # total diffusion steps
+        num_steps: int = 1000,       # total diffusion steps
         beta_start: float = 1e-4,   # first beta value
         beta_end: float = 2e-2,     # last beta value
         clip_x0: bool = True,      # clamp predicted x0 to avoid explosions
