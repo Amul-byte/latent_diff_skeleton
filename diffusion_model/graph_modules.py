@@ -472,9 +472,13 @@ class GraphDenoiserMasked(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # conditioning projection (expects last dim = latent_dim) for cross-attention K/V
-        self.cond_proj = nn.Linear(latent_dim, hidden_dim)
-        self.cross_attn = CrossAttentionBlock(hidden_dim=hidden_dim, num_heads=num_heads)
+        # conditioning projection + cross-attention (proposal-faithful conditioning path)
+        self.h_proj = nn.Linear(latent_dim, hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
 
         # graph layers
         self.graph_layers = nn.ModuleList(
@@ -490,7 +494,7 @@ class GraphDenoiserMasked(nn.Module):
 
     def _prepare_h(self, h: Optional[torch.Tensor], target_shape: torch.Size) -> Optional[torch.Tensor]:
         """
-        Convert h into context tokens [B,T,K,D] for cross-attention.
+        Validate h shape before cross-attention.
 
         target_shape is z_t.shape: [B,T,J,D]
         """
@@ -502,10 +506,8 @@ class GraphDenoiserMasked(nn.Module):
             B, T, D = h.shape
             if (B, T) != (target_shape[0], target_shape[1]):
                 raise ValueError("h [B,T,D] must match z_t [B,T,J,D] on first 2 dims")
-            # sequence context => one key/value token per timestep: [B,T,1,D]
-            h = h.unsqueeze(2)
 
-        # or h could already be [B,T,J,D]
+        # h could already be [B,T,K,D] (K can be J for h_joint)
         elif h.ndim == 4:
             if tuple(h.shape[:2]) != tuple(target_shape[:2]):
                 raise ValueError("h [B,T,K,D] must match z_t on [B,T]")
@@ -556,10 +558,20 @@ class GraphDenoiserMasked(nn.Module):
         # [B,hidden_dim] -> [B,1,1,hidden_dim]
         hidden = hidden + t_emb.view(B, 1, 1, self.hidden_dim)
 
-        # cross-attention conditioning (latent queries -> sensor context keys/values)
+        # cross-attention conditioning (latent queries -> sensor tokens as K/V)
         if h is not None:
-            context = self.cond_proj(h)  # [B,T,K,hidden_dim]
-            hidden = hidden + self.cross_attn(query_tokens=hidden, context_tokens=context)
+            hidden_tokens = hidden.reshape(B, T * J, self.hidden_dim)  # [B,TJ,H]
+
+            if h.ndim == 4:
+                # h_joint [B,T,K,D] -> [B,TK,D]
+                h_tokens = h.reshape(B, h.shape[1] * h.shape[2], h.shape[3])
+            else:
+                # h_seq [B,T,D] -> [B,T,D]
+                h_tokens = h
+
+            h_tokens = self.h_proj(h_tokens)  # [B,N,H]
+            attn_out, _ = self.cross_attn(hidden_tokens, h_tokens, h_tokens, need_weights=False)
+            hidden = hidden + attn_out.view(B, T, J, self.hidden_dim)
 
         # ---- Graph + temporal blocks ----
         for layer in self.graph_layers:

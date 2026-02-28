@@ -311,6 +311,11 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
     """
     This dataset builds training samples (windows) from SmartFall CSVs.
 
+    Proposal alignment note (Option A, accel-only):
+      - We interpret S=(A, Omega) as two accelerometer streams:
+          A1 = right-hip accel, A2 = left-wrist accel.
+      - Gyroscope is not used in this option.
+
     Each sample you get is a dictionary with:
       "X"      : skeleton window  [T, 32, 3]
       "A1"     : sensor1 accel    [T, 3]

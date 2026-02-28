@@ -3,6 +3,11 @@ imu_encoder.py
 
 This file turns IMU acceleration signals into "features" that the diffusion model can use.
 
+Proposal alignment note (Option A, accel-only):
+- We map S=(A, Omega) to two accelerometer sources:
+  A1 = right-hip accel, A2 = left-wrist accel.
+- Gyroscope is intentionally not used in this option.
+
 ✅ Matches your dataset.py:
 - dataset returns:
     batch["A1"]    -> [B, T, 3]   (sensor 1 accel)

@@ -64,6 +64,7 @@ from diffusion_model.util import (
     resolve_device,
     set_seed,
     build_smartfall_bone_adjacency,
+    assert_smartfall_bone_adjacency,
     count_trainable_parameters,
 )
 
@@ -224,12 +225,12 @@ def make_loaders(
 # ---------------------------
 
 @torch.no_grad()
-def eval_stage1(model: SkeletonStage1Model, loader: DataLoader, adjacency: torch.Tensor, device: torch.device, mode: str) -> float:
+def eval_stage1(model: SkeletonStage1Model, loader: DataLoader, adjacency: torch.Tensor, device: torch.device) -> float:
     model.eval()
     losses = []
     for batch in loader:
         X = batch["X"].to(device, non_blocking=True)  # [B,T,J,3]
-        out = model.forward_stage1(X, adjacency=adjacency, mode=mode)
+        out = model.forward_stage1(X, adjacency=adjacency, mode="diff")
         losses.append(out["loss"].detach().float().item())
     return float(sum(losses) / max(1, len(losses)))
 
@@ -245,13 +246,8 @@ def train_stage1(
     stage_dir = run_dir / "stage1"
     ensure_dir(stage_dir)
 
-    if args.stage1_mode != "diff":
-        raise ValueError(
-            "EXACT proposal mode requires Stage 1 diffusion-only. "
-            "Use --stage1_mode diff."
-        )
-
     adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
+    assert_smartfall_bone_adjacency(adjacency, include_self=True)
 
     model = SkeletonStage1Model(
         joint_dim=3,
@@ -266,7 +262,7 @@ def train_stage1(
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     best_val = math.inf
-    mode = args.stage1_mode  # diffusion-only for exact proposal
+    mode = "diff"
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -277,7 +273,7 @@ def train_stage1(
             X = batch["X"].to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
 
-            out = model.forward_stage1(X, adjacency=adjacency, mode=mode)
+            out = model.forward_stage1(X, adjacency=adjacency, mode="diff")
             loss = out["loss"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -286,7 +282,7 @@ def train_stage1(
             running += float(loss.detach().cpu().item())
             pbar.set_postfix(loss=f"{running/max(1,pbar.n):.4f}")
 
-        val_loss = eval_stage1(model, val_loader, adjacency, device, mode=mode)
+        val_loss = eval_stage1(model, val_loader, adjacency, device)
         logger.info(f"[Stage1/{mode}] epoch={epoch} train_loss={running/max(1,len(train_loader)):.4f} val_loss={val_loss:.4f}")
 
         # Save last
@@ -353,6 +349,7 @@ def train_stage2(
     ensure_dir(stage_dir)
 
     adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
+    assert_smartfall_bone_adjacency(adjacency, include_self=True)
 
     # Load Stage1 checkpoint and freeze
     stage1 = SkeletonStage1Model(
@@ -510,6 +507,7 @@ def train_stage3(
     ensure_dir(stage_dir)
 
     adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
+    assert_smartfall_bone_adjacency(adjacency, include_self=True)
 
     # Load + freeze Stage1
     stage1 = SkeletonStage1Model(
@@ -645,8 +643,18 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--skeleton_folder", type=str, required=True)
-    p.add_argument("--right_hip_folder", type=str, required=True)
-    p.add_argument("--left_wrist_folder", type=str, required=True)
+    p.add_argument(
+        "--right_hip_folder",
+        type=str,
+        required=True,
+        help="Option A (accel-only): right-hip accelerometer CSV folder (proposal A/Omega mapping).",
+    )
+    p.add_argument(
+        "--left_wrist_folder",
+        type=str,
+        required=True,
+        help="Option A (accel-only): left-wrist accelerometer CSV folder (proposal A/Omega mapping).",
+    )
 
     p.add_argument("--window", type=int, default=60)
     p.add_argument("--stride", type=int, default=30)
@@ -688,9 +696,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graph_layers", type=int, default=3)
     p.add_argument("--graph_heads", type=int, default=8)
     p.add_argument("--diffusion_steps", type=int, default=500)
-
-    # Stage 1 specific (EXACT proposal: diffusion-only)
-    p.add_argument("--stage1_mode", type=str, default="diff", choices=["diff"])
 
     # Stage 2 specific
     p.add_argument("--stage1_ckpt", type=str, default=None, help="Required for stage 2/3")
@@ -755,6 +760,11 @@ def main() -> None:
 
     if args.stage in (2, 3) and not args.stage1_ckpt:
         raise ValueError("--stage1_ckpt is required for stage 2 or stage 3")
+    if args.stage in (2, 3) and args.stage1_ckpt and "stage1_ae" in str(args.stage1_ckpt).lower():
+        raise ValueError(
+            "EXACT proposal mode forbids Stage1 AE checkpoints. "
+            "Use a diffusion-only Stage1 checkpoint."
+        )
 
     if args.stage == 2:
         train_stage2(args, train_loader, val_loader, run_dir, device, logger)

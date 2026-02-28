@@ -25,6 +25,21 @@ from typing import Optional, Sequence, Union
 import numpy as np
 import torch
 
+SMARTFALL_BONE_EDGES: tuple[tuple[int, int], ...] = (
+    # trunk
+    (0, 1), (1, 2), (2, 3), (3, 26), (26, 27),
+    # face
+    (27, 28), (28, 29), (27, 30), (30, 31),
+    # left arm
+    (2, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 10),
+    # right arm
+    (2, 11), (11, 12), (12, 13), (13, 14), (14, 15), (15, 16), (14, 17),
+    # left leg
+    (0, 18), (18, 19), (19, 20), (20, 21),
+    # right leg
+    (0, 22), (22, 23), (23, 24), (24, 25),
+)
+
 
 # ------------------------------------------------------------
 # 1) Reproducibility: set all random seeds
@@ -218,30 +233,50 @@ def build_smartfall_bone_adjacency(
             "Update the edge list if your dataset uses a different joint layout."
         )
 
-    edges = [
-        # trunk
-        (0, 1), (1, 2), (2, 3), (3, 26), (26, 27),
-        # face
-        (27, 28), (28, 29), (27, 30), (30, 31),
-        # left arm
-        (2, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 10),
-        # right arm
-        (2, 11), (11, 12), (12, 13), (13, 14), (14, 15), (15, 16), (14, 17),
-        # left leg
-        (0, 18), (18, 19), (19, 20), (20, 21),
-        # right leg
-        (0, 22), (22, 23), (23, 24), (24, 25),
-    ]
-
     adj = torch.zeros((J, J), dtype=torch.float32, device=device)
-    for i, j in edges:
+    for i, j in SMARTFALL_BONE_EDGES:
         adj[i, j] = 1.0
         adj[j, i] = 1.0
 
     if include_self:
         adj.fill_diagonal_(1.0)
 
+    assert_smartfall_bone_adjacency(adj, include_self=include_self)
     return adj
+
+
+def assert_smartfall_bone_adjacency(adjacency: torch.Tensor, include_self: bool = True) -> None:
+    """
+    Strictly validate that adjacency uses only SmartFall bone edges (+ optional self loops).
+    """
+    assert_rank(adjacency, 2, "adjacency")
+    J0, J1 = adjacency.shape
+    if (J0, J1) != (32, 32):
+        raise AssertionError(f"adjacency must be [32,32], got {tuple(adjacency.shape)}")
+
+    # allow exact binary mask only
+    adj = adjacency.detach().to(dtype=torch.float32)
+    if not torch.all((adj == 0.0) | (adj == 1.0)):
+        raise AssertionError("adjacency must be binary (0/1)")
+
+    # undirected graph only
+    if not torch.equal(adj, adj.t()):
+        raise AssertionError("adjacency must be symmetric")
+
+    expected = torch.zeros((32, 32), dtype=torch.float32, device=adj.device)
+    for i, j in SMARTFALL_BONE_EDGES:
+        expected[i, j] = 1.0
+        expected[j, i] = 1.0
+    if include_self:
+        expected.fill_diagonal_(1.0)
+
+    if not torch.equal(adj, expected):
+        extra = torch.nonzero((adj == 1.0) & (expected == 0.0), as_tuple=False)
+        missing = torch.nonzero((adj == 0.0) & (expected == 1.0), as_tuple=False)
+        raise AssertionError(
+            f"adjacency must contain only SmartFall bone edges (+self={include_self}); "
+            f"extra_edges={extra.shape[0]}, missing_edges={missing.shape[0]}"
+        )
 
 
 # ------------------------------------------------------------

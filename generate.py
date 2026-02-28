@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from diffusion_model.model import Stage3Model
 from diffusion_model.sensor_model import SensorTGNNEncoder
 from diffusion_model.model_loader import load_checkpoint
-from diffusion_model.util import build_smartfall_bone_adjacency, resolve_device
+from diffusion_model.util import build_smartfall_bone_adjacency, assert_smartfall_bone_adjacency, resolve_device
 
 
 def set_seed_local(seed: int):
@@ -40,6 +40,7 @@ def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
 
 def _bone_connections(num_joints: int) -> list[tuple[int, int]]:
     adj = build_smartfall_bone_adjacency(num_joints=num_joints, include_self=False, device=torch.device("cpu"))
+    assert_smartfall_bone_adjacency(adj, include_self=False)
     idx = torch.nonzero(torch.triu(adj, diagonal=1), as_tuple=False)
     return [(int(i), int(j)) for i, j in idx.tolist()]
 
@@ -227,6 +228,7 @@ def generate_samples(args, sensor_model, diffusion_model, device):
         # Generate latent using your diffusion model (Stage3Model)
         # This is the equivalent of diffusion_process.generate(...) in your sample
         adjacency = build_smartfall_bone_adjacency(num_joints=diffusion_model.num_joints, include_self=True, device=device)
+        assert_smartfall_bone_adjacency(adjacency, include_self=True)
 
         batch_n = sensor1.shape[0]
         z0_hat = diffusion_model.sample_latent(
@@ -306,8 +308,18 @@ if __name__ == "__main__":
     parser.add_argument("--sensor_ckpt", type=str, required=True)
 
     # dataset paths (same style as your sample)
-    parser.add_argument("--right_hip_folder", type=str, required=True)
-    parser.add_argument("--left_wrist_folder", type=str, required=True)
+    parser.add_argument(
+        "--right_hip_folder",
+        type=str,
+        required=True,
+        help="Option A (accel-only): right-hip accelerometer CSV folder (proposal A/Omega mapping).",
+    )
+    parser.add_argument(
+        "--left_wrist_folder",
+        type=str,
+        required=True,
+        help="Option A (accel-only): left-wrist accelerometer CSV folder (proposal A/Omega mapping).",
+    )
     parser.add_argument("--skeleton_folder", type=str, required=True)
 
     # generation params
