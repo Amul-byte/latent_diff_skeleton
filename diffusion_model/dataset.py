@@ -339,7 +339,9 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
         imu_stats: dict | None = None,       # pass train stats here for val/test
         imu_eps: float = 1e-6,
         imu_clip: float | None = 6.0,
-        sensor_names: tuple[str, str] = ("sensor1", "sensor2"),
+        sensor_names: tuple[str, str] = ("right_hip", "left_wrist"),
+        sensor_roots: tuple[str, str] | None = None,
+        strict_sensor_identity: bool = True,
     ):
         # store the input CSV dictionaries
         self.skeleton_data = skeleton_data
@@ -364,6 +366,17 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
         self.imu_eps = float(imu_eps)
         self.imu_clip = imu_clip
         self.sensor_names = sensor_names
+        self.sensor_roots = sensor_roots
+        self.strict_sensor_identity = bool(strict_sensor_identity)
+
+        if self.strict_sensor_identity:
+            if self.sensor_roots is None:
+                raise ValueError(
+                    "strict_sensor_identity=True requires sensor_roots=(right_hip_folder, left_wrist_folder)."
+                )
+            if len(self.sensor_roots) != 2:
+                raise ValueError("sensor_roots must contain exactly two paths.")
+            self._validate_sensor_identity_from_roots()
 
         # find filenames common across skeleton/sensor1/sensor2
         files = common_files(skeleton_data, sensor1_data, sensor2_data)
@@ -575,6 +588,13 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
         A1_t = torch.tensor(s1_win, dtype=torch.float32)     # [T,3]
         A2_t = torch.tensor(s2_win, dtype=torch.float32)     # [T,3]
 
+        # strict shape contract for IMU streams
+        T = self.window_size
+        if tuple(A1_t.shape) != (T, 3):
+            raise ValueError(f"A1 must be [T,3] with T={T}, got shape {tuple(A1_t.shape)} for file {fname}")
+        if tuple(A2_t.shape) != (T, 3):
+            raise ValueError(f"A2 must be [T,3] with T={T}, got shape {tuple(A2_t.shape)} for file {fname}")
+
         # get label for this window
         y_t = self.labels[idx]
 
@@ -615,6 +635,29 @@ class SmartFallPairedSlidingWindowDataset(Dataset):
             "file": fname,                             # debug info
             "start": torch.tensor(start, dtype=torch.long),  # debug info
         }
+
+    def _validate_sensor_identity_from_roots(self) -> None:
+        """
+        Hard fail when folder naming does not match required sensor pair:
+          - sensor1 path must indicate right hip
+          - sensor2 path must indicate left wrist
+        """
+        assert self.sensor_roots is not None
+        right_hip_root, left_wrist_root = self.sensor_roots
+
+        p1 = os.path.basename(str(right_hip_root).strip("/\\")).lower()
+        p2 = os.path.basename(str(left_wrist_root).strip("/\\")).lower()
+
+        # expected mapping: A1=right_hip, A2=left_wrist
+        # allow compact forms in folder names.
+        hip_ok = ("hip" in p1) and ("right" in p1 or "rhip" in p1 or p1.endswith("hip") or "meta_hip" in p1)
+        wrist_ok = ("wrist" in p2) and ("left" in p2 or "lwrist" in p2 or p2.endswith("wrist") or "meta_wrist" in p2)
+
+        if not hip_ok or not wrist_ok:
+            raise ValueError(
+                "Sensor identity check failed. Expected A1=right hip folder and A2=left wrist folder. "
+                f"Got sensor_roots=({right_hip_root}, {left_wrist_root})."
+            )
 
 
 # ------------------------------------------------------------

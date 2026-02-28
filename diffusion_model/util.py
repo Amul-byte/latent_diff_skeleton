@@ -194,6 +194,57 @@ def build_chain_adjacency(
 
 
 # ------------------------------------------------------------
+# 5b) Build SmartFall anatomical bone adjacency matrix (32 joints)
+# ------------------------------------------------------------
+def build_smartfall_bone_adjacency(
+    num_joints: int = 32,
+    include_self: bool = True,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Build adjacency for SmartFall 32-joint skeleton using anatomical bone edges.
+
+    Expected joint indexing (Kinect-style 32-joint layout):
+      0 pelvis, 1 spine_navel, 2 spine_chest, 3 neck, 4 clavicle_l, 5 shoulder_l,
+      6 elbow_l, 7 wrist_l, 8 hand_l, 9 handtip_l, 10 thumb_l, 11 clavicle_r,
+      12 shoulder_r, 13 elbow_r, 14 wrist_r, 15 hand_r, 16 handtip_r, 17 thumb_r,
+      18 hip_l, 19 knee_l, 20 ankle_l, 21 foot_l, 22 hip_r, 23 knee_r, 24 ankle_r,
+      25 foot_r, 26 head, 27 nose, 28 eye_l, 29 ear_l, 30 eye_r, 31 ear_r.
+    """
+    J = int(num_joints)
+    if J != 32:
+        raise ValueError(
+            f"build_smartfall_bone_adjacency expects num_joints=32, got {J}. "
+            "Update the edge list if your dataset uses a different joint layout."
+        )
+
+    edges = [
+        # trunk
+        (0, 1), (1, 2), (2, 3), (3, 26), (26, 27),
+        # face
+        (27, 28), (28, 29), (27, 30), (30, 31),
+        # left arm
+        (2, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 10),
+        # right arm
+        (2, 11), (11, 12), (12, 13), (13, 14), (14, 15), (15, 16), (14, 17),
+        # left leg
+        (0, 18), (18, 19), (19, 20), (20, 21),
+        # right leg
+        (0, 22), (22, 23), (23, 24), (24, 25),
+    ]
+
+    adj = torch.zeros((J, J), dtype=torch.float32, device=device)
+    for i, j in edges:
+        adj[i, j] = 1.0
+        adj[j, i] = 1.0
+
+    if include_self:
+        adj.fill_diagonal_(1.0)
+
+    return adj
+
+
+# ------------------------------------------------------------
 # 6) Choose device (cpu or gpu)
 # ------------------------------------------------------------
 def resolve_device(device: Optional[str] = None) -> torch.device:

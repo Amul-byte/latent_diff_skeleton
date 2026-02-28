@@ -63,7 +63,7 @@ from diffusion_model.util import (
     get_logger,
     resolve_device,
     set_seed,
-    build_chain_adjacency,
+    build_smartfall_bone_adjacency,
     count_trainable_parameters,
 )
 
@@ -100,8 +100,8 @@ def split_subjects(
 
 def make_loaders(
     skeleton_folder: str,
-    sensor1_folder: str,
-    sensor2_folder: str,
+    right_hip_folder: str,
+    left_wrist_folder: str,
     window: int,
     stride: int,
     train_ratio: float,
@@ -120,8 +120,8 @@ def make_loaders(
     Ensures val uses train IMU stats (if zscore).
     """
     skeleton_data = read_csv_files(skeleton_folder)
-    sensor1_data = read_csv_files(sensor1_folder)
-    sensor2_data = read_csv_files(sensor2_folder)
+    sensor1_data = read_csv_files(right_hip_folder)
+    sensor2_data = read_csv_files(left_wrist_folder)
 
     # Build a temporary dataset (to compute common files list through its init logic)
     tmp_ds = SmartFallPairedSlidingWindowDataset(
@@ -139,7 +139,9 @@ def make_loaders(
         imu_stats=None,
         imu_eps=imu_eps,
         imu_clip=imu_clip,
-        sensor_names=("sensor1", "sensor2"),
+        sensor_names=("right_hip", "left_wrist"),
+        sensor_roots=(right_hip_folder, left_wrist_folder),
+        strict_sensor_identity=True,
     )
     all_files = tmp_ds.files
     train_subj, val_subj = split_subjects(all_files, train_ratio=train_ratio, seed=seed)
@@ -159,7 +161,9 @@ def make_loaders(
         imu_stats=None,  # compute from train only
         imu_eps=imu_eps,
         imu_clip=imu_clip,
-        sensor_names=("sensor1", "sensor2"),
+        sensor_names=("right_hip", "left_wrist"),
+        sensor_roots=(right_hip_folder, left_wrist_folder),
+        strict_sensor_identity=True,
     )
     train_stats = train_ds.get_normalization_stats()
 
@@ -178,7 +182,9 @@ def make_loaders(
         imu_stats=train_stats if imu_norm == "zscore" else None,
         imu_eps=imu_eps,
         imu_clip=imu_clip,
-        sensor_names=("sensor1", "sensor2"),
+        sensor_names=("right_hip", "left_wrist"),
+        sensor_roots=(right_hip_folder, left_wrist_folder),
+        strict_sensor_identity=True,
     )
 
     train_loader = DataLoader(
@@ -214,55 +220,6 @@ def make_loaders(
 
 
 # ---------------------------
-# Stage 2: simple IMU->latent regressor head
-# ---------------------------
-
-class IMUToLatentRegressor(nn.Module):
-    """
-    Maps IMU conditioning (h_joint or h_seq) -> predicted latent z [B,T,J,D].
-
-    We keep it simple and aligned with your conditioning shapes.
-
-    If mode="joint": input h_joint [B,T,J,D] -> output z_pred [B,T,J,D]
-    If mode="seq"  : input h_seq   [B,T,D]   -> output z_pred [B,T,J,D] by expanding over J
-    """
-    def __init__(self, latent_dim: int, num_joints: int, mode: str = "joint", hidden: int = 256) -> None:
-        super().__init__()
-        if mode not in ("joint", "seq"):
-            raise ValueError("mode must be 'joint' or 'seq'")
-        self.mode = mode
-        self.latent_dim = latent_dim
-        self.num_joints = num_joints
-
-        if self.mode == "joint":
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, latent_dim),
-            )
-        else:
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, latent_dim),
-            )
-            self.joint_tokens = nn.Parameter(torch.randn(1, 1, num_joints, latent_dim) * 0.02)
-
-    def forward(self, h_joint: Optional[torch.Tensor], h_seq: Optional[torch.Tensor]) -> torch.Tensor:
-        if self.mode == "joint":
-            if h_joint is None or h_joint.ndim != 4:
-                raise ValueError("mode='joint' requires h_joint [B,T,J,D]")
-            return self.net(h_joint)
-        else:
-            if h_seq is None or h_seq.ndim != 3:
-                raise ValueError("mode='seq' requires h_seq [B,T,D]")
-            z = self.net(h_seq)  # [B,T,D]
-            B, T, D = z.shape
-            z = z.unsqueeze(2) + self.joint_tokens.expand(B, T, self.num_joints, D)  # [B,T,J,D]
-            return z
-
-
-# ---------------------------
 # Train/eval loops
 # ---------------------------
 
@@ -288,7 +245,13 @@ def train_stage1(
     stage_dir = run_dir / "stage1"
     ensure_dir(stage_dir)
 
-    adjacency = build_chain_adjacency(args.num_joints, include_self=True, device=device)
+    if args.stage1_mode != "diff":
+        raise ValueError(
+            "EXACT proposal mode requires Stage 1 diffusion-only. "
+            "Use --stage1_mode diff."
+        )
+
+    adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
 
     model = SkeletonStage1Model(
         joint_dim=3,
@@ -303,7 +266,7 @@ def train_stage1(
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     best_val = math.inf
-    mode = args.stage1_mode  # "ae" or "diff"
+    mode = args.stage1_mode  # diffusion-only for exact proposal
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -335,28 +298,40 @@ def train_stage1(
             logger.info(f"[Stage1/{mode}] Saved best.pt (val_loss={best_val:.4f})")
 
 
+def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Resample [B,T,3] IMU stream to target time length (linear interpolation)."""
+    if x.shape[1] == target_len:
+        return x
+    x_bct = x.transpose(1, 2)  # [B,3,T]
+    x_rs = torch.nn.functional.interpolate(x_bct, size=target_len, mode="linear", align_corners=False)
+    return x_rs.transpose(1, 2)  # [B,target_len,3]
+
+
 @torch.no_grad()
 def eval_stage2(
     imu_encoder: SensorTGNNEncoder,
-    reg: IMUToLatentRegressor,
     stage1: SkeletonStage1Model,
     loader: DataLoader,
     adjacency: torch.Tensor,
     device: torch.device,
 ) -> float:
     imu_encoder.eval()
-    reg.eval()
     stage1.eval()
     losses = []
     for batch in loader:
         X = batch["X"].to(device, non_blocking=True)
         A1 = batch["A1"].to(device, non_blocking=True)
         A2 = batch["A2"].to(device, non_blocking=True)
+        A1 = _resample_to_len(A1, X.shape[1])
+        A2 = _resample_to_len(A2, X.shape[1])
 
         z0 = stage1.encoder(X, adjacency)  # frozen
-        h_joint, h_seq = imu_encoder(A1, A2)
-        z_pred = reg(h_joint=h_joint if reg.mode == "joint" else None, h_seq=h_seq if reg.mode == "seq" else None)
-        loss = F.mse_loss(z_pred, z0)
+        h_joint, _h_seq = imu_encoder(A1, A2)
+        assert h_joint.shape == z0.shape, (
+            f"Shape mismatch: h_joint={tuple(h_joint.shape)} vs z0={tuple(z0.shape)}. "
+            "SensorTGNNEncoder must output h_joint with shape [B,T,J,D]."
+        )
+        loss = F.mse_loss(h_joint, z0)
         losses.append(float(loss.detach().cpu().item()))
     return float(sum(losses) / max(1, len(losses)))
 
@@ -371,13 +346,13 @@ def train_stage2(
 ) -> None:
     """
     Stage 2 in your proposal: IMU -> latent alignment (regression).
-    We freeze Stage-1 encoder and learn:
-      IMUEncoder + RegressorHead: z_pred ~= z0_target
+    We freeze Stage-1 encoder and learn only IMUEncoder:
+      h_joint ~= z0_target
     """
     stage_dir = run_dir / "stage2"
     ensure_dir(stage_dir)
 
-    adjacency = build_chain_adjacency(args.num_joints, include_self=True, device=device)
+    adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
 
     # Load Stage1 checkpoint and freeze
     stage1 = SkeletonStage1Model(
@@ -398,21 +373,13 @@ def train_stage2(
         hidden_dim=args.imu_hidden_dim,
     ).to(device)
 
-    reg = IMUToLatentRegressor(
-        latent_dim=args.latent_dim,
-        num_joints=args.num_joints,
-        mode=args.stage2_reg_mode,  # "joint" or "seq"
-        hidden=args.stage2_reg_hidden,
-    ).to(device)
-
-    params = list(imu_encoder.parameters()) + list(reg.parameters())
+    params = list(imu_encoder.parameters())
     logger.info(f"[Stage2] Trainable params: {sum(p.numel() for p in params if p.requires_grad):,}")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
 
     best_val = math.inf
     for epoch in range(1, args.epochs + 1):
         imu_encoder.train()
-        reg.train()
 
         pbar = tqdm(train_loader, desc=f"Stage2 Epoch {epoch}/{args.epochs}")
         running = 0.0
@@ -421,14 +388,18 @@ def train_stage2(
             X = batch["X"].to(device, non_blocking=True)
             A1 = batch["A1"].to(device, non_blocking=True)
             A2 = batch["A2"].to(device, non_blocking=True)
+            A1 = _resample_to_len(A1, X.shape[1])
+            A2 = _resample_to_len(A2, X.shape[1])
 
             with torch.no_grad():
                 z0 = stage1.encoder(X, adjacency)
 
-            h_joint, h_seq = imu_encoder(A1, A2)
-            z_pred = reg(h_joint=h_joint if reg.mode == "joint" else None, h_seq=h_seq if reg.mode == "seq" else None)
-
-            loss = F.mse_loss(z_pred, z0)
+            h_joint, _h_seq = imu_encoder(A1, A2)
+            assert h_joint.shape == z0.shape, (
+                f"Shape mismatch: h_joint={tuple(h_joint.shape)} vs z0={tuple(z0.shape)}. "
+                "SensorTGNNEncoder must output h_joint with shape [B,T,J,D]."
+            )
+            loss = F.mse_loss(h_joint, z0)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -438,18 +409,18 @@ def train_stage2(
             running += float(loss.detach().cpu().item())
             pbar.set_postfix(loss=f"{running/max(1,pbar.n):.4f}")
 
-        val_loss = eval_stage2(imu_encoder, reg, stage1, val_loader, adjacency, device)
+        val_loss = eval_stage2(imu_encoder, stage1, val_loader, adjacency, device)
         logger.info(f"[Stage2] epoch={epoch} train_loss={running/max(1,len(train_loader)):.4f} val_loss={val_loss:.4f}")
 
         torch.save(
-            {"imu_encoder": imu_encoder.state_dict(), "reg": reg.state_dict(), "args": vars(args)},
+            {"imu_encoder": imu_encoder.state_dict(), "args": vars(args)},
             stage_dir / "last.pt",
         )
 
         if val_loss < best_val:
             best_val = val_loss
             torch.save(
-                {"imu_encoder": imu_encoder.state_dict(), "reg": reg.state_dict(), "args": vars(args)},
+                {"imu_encoder": imu_encoder.state_dict(), "args": vars(args)},
                 stage_dir / "best.pt",
             )
             logger.info(f"[Stage2] Saved best.pt (val_loss={best_val:.4f})")
@@ -487,6 +458,8 @@ def eval_stage3(
         if use_imu:
             A1 = batch["A1"].to(device, non_blocking=True)
             A2 = batch["A2"].to(device, non_blocking=True)
+            A1 = _resample_to_len(A1, X.shape[1])
+            A2 = _resample_to_len(A2, X.shape[1])
             h_joint, h_seq = imu_encoder(A1, A2)  # type: ignore[union-attr]
             h = h_joint if stage3_cond_mode(stage3) == "joint" else h_seq
 
@@ -536,7 +509,7 @@ def train_stage3(
     stage_dir = run_dir / "stage3"
     ensure_dir(stage_dir)
 
-    adjacency = build_chain_adjacency(args.num_joints, include_self=True, device=device)
+    adjacency = build_smartfall_bone_adjacency(args.num_joints, include_self=True, device=device)
 
     # Load + freeze Stage1
     stage1 = SkeletonStage1Model(
@@ -616,6 +589,8 @@ def train_stage3(
             if use_imu:
                 A1 = batch["A1"].to(device, non_blocking=True)
                 A2 = batch["A2"].to(device, non_blocking=True)
+                A1 = _resample_to_len(A1, X.shape[1])
+                A2 = _resample_to_len(A2, X.shape[1])
                 h_joint, h_seq = imu_encoder(A1, A2)  # type: ignore[misc]
                 h = h_joint if cond_mode == "joint" else h_seq
 
@@ -670,8 +645,8 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--skeleton_folder", type=str, required=True)
-    p.add_argument("--sensor1_folder", type=str, required=True)
-    p.add_argument("--sensor2_folder", type=str, required=True)
+    p.add_argument("--right_hip_folder", type=str, required=True)
+    p.add_argument("--left_wrist_folder", type=str, required=True)
 
     p.add_argument("--window", type=int, default=60)
     p.add_argument("--stride", type=int, default=30)
@@ -714,14 +689,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graph_heads", type=int, default=8)
     p.add_argument("--diffusion_steps", type=int, default=500)
 
-    # Stage 1 specific
-    p.add_argument("--stage1_mode", type=str, default="ae", choices=["ae", "diff"])
+    # Stage 1 specific (EXACT proposal: diffusion-only)
+    p.add_argument("--stage1_mode", type=str, default="diff", choices=["diff"])
 
     # Stage 2 specific
     p.add_argument("--stage1_ckpt", type=str, default=None, help="Required for stage 2/3")
     p.add_argument("--imu_hidden_dim", type=int, default=256)
-    p.add_argument("--stage2_reg_mode", type=str, default="joint", choices=["joint", "seq"])
-    p.add_argument("--stage2_reg_hidden", type=int, default=256)
 
     # Stage 3 specific
     p.add_argument("--stage3_use_imu", action="store_true", help="Use IMU conditioning in stage 3")
@@ -757,8 +730,8 @@ def main() -> None:
     # Data loaders (subject-wise split)
     train_loader, val_loader, meta = make_loaders(
         skeleton_folder=args.skeleton_folder,
-        sensor1_folder=args.sensor1_folder,
-        sensor2_folder=args.sensor2_folder,
+        right_hip_folder=args.right_hip_folder,
+        left_wrist_folder=args.left_wrist_folder,
         window=args.window,
         stride=args.stride,
         train_ratio=args.train_ratio,

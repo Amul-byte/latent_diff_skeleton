@@ -248,6 +248,61 @@ class MaskedGraphAttentionBlock(nn.Module):
 
 
 # ------------------------------------------------------------
+# 3b) Cross-attention block (latent queries -> sensor context)
+# ------------------------------------------------------------
+class CrossAttentionBlock(nn.Module):
+    """
+    Cross-attention over context tokens for each time step.
+
+    query_tokens:   [B,T,Nq,C]
+    context_tokens: [B,T,Nk,C]
+    output:         [B,T,Nq,C]
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.q_norm = nn.LayerNorm(hidden_dim)
+        self.kv_norm = nn.LayerNorm(hidden_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, query_tokens: torch.Tensor, context_tokens: torch.Tensor) -> torch.Tensor:
+        _check_rank("query_tokens", query_tokens, 4)
+        _check_rank("context_tokens", context_tokens, 4)
+
+        B, T, Nq, C = query_tokens.shape
+        Bc, Tc, Nk, Cc = context_tokens.shape
+        if (Bc, Tc) != (B, T):
+            raise ValueError("context_tokens must match query_tokens on [B,T]")
+        if C != self.hidden_dim or Cc != self.hidden_dim:
+            raise ValueError("query/context feature dim must equal hidden_dim")
+
+        q_in = self.q_norm(query_tokens)
+        kv_in = self.kv_norm(context_tokens)
+
+        # run attention per timestep by flattening [B,T] into batch
+        q = self.q_proj(q_in).reshape(B * T, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(kv_in).reshape(B * T, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(kv_in).reshape(B * T, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [BT,H,Nq,Nk]
+        w = torch.softmax(scores, dim=-1)
+        out = torch.matmul(w, v)  # [BT,H,Nq,HD]
+
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(B, T, Nq, C)
+        return self.out_proj(out)
+
+
+# ------------------------------------------------------------
 # 4) GraphEncoder: skeleton -> latent
 # ------------------------------------------------------------
 class GraphEncoder(nn.Module):
@@ -417,8 +472,9 @@ class GraphDenoiserMasked(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # conditioning projection (expects last dim = latent_dim)
+        # conditioning projection (expects last dim = latent_dim) for cross-attention K/V
         self.cond_proj = nn.Linear(latent_dim, hidden_dim)
+        self.cross_attn = CrossAttentionBlock(hidden_dim=hidden_dim, num_heads=num_heads)
 
         # graph layers
         self.graph_layers = nn.ModuleList(
@@ -434,9 +490,9 @@ class GraphDenoiserMasked(nn.Module):
 
     def _prepare_h(self, h: Optional[torch.Tensor], target_shape: torch.Size) -> Optional[torch.Tensor]:
         """
-        Convert h into shape [B,T,J,D] so it can be added to hidden.
+        Convert h into context tokens [B,T,K,D] for cross-attention.
 
-        target_shape is z_t.shape which is [B,T,J,D]
+        target_shape is z_t.shape: [B,T,J,D]
         """
         if h is None:
             return None
@@ -446,13 +502,15 @@ class GraphDenoiserMasked(nn.Module):
             B, T, D = h.shape
             if (B, T) != (target_shape[0], target_shape[1]):
                 raise ValueError("h [B,T,D] must match z_t [B,T,J,D] on first 2 dims")
-            # expand to [B,T,J,D]
-            h = h.unsqueeze(2).expand(B, T, target_shape[2], D)
+            # sequence context => one key/value token per timestep: [B,T,1,D]
+            h = h.unsqueeze(2)
 
         # or h could already be [B,T,J,D]
         elif h.ndim == 4:
-            if tuple(h.shape[:3]) != tuple(target_shape[:3]):
-                raise ValueError("h [B,T,J,D] must match z_t on [B,T,J]")
+            if tuple(h.shape[:2]) != tuple(target_shape[:2]):
+                raise ValueError("h [B,T,K,D] must match z_t on [B,T]")
+            if h.shape[2] <= 0:
+                raise ValueError("h context token count K must be > 0")
 
         else:
             raise ValueError("h must be rank 3 or 4")
@@ -498,9 +556,10 @@ class GraphDenoiserMasked(nn.Module):
         # [B,hidden_dim] -> [B,1,1,hidden_dim]
         hidden = hidden + t_emb.view(B, 1, 1, self.hidden_dim)
 
-        # add conditioning if we have it
+        # cross-attention conditioning (latent queries -> sensor context keys/values)
         if h is not None:
-            hidden = hidden + self.cond_proj(h)
+            context = self.cond_proj(h)  # [B,T,K,hidden_dim]
+            hidden = hidden + self.cross_attn(query_tokens=hidden, context_tokens=context)
 
         # ---- Graph + temporal blocks ----
         for layer in self.graph_layers:

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from diffusion_model.model import Stage3Model
 from diffusion_model.sensor_model import SensorTGNNEncoder
 from diffusion_model.model_loader import load_checkpoint
-from diffusion_model.util import build_chain_adjacency, resolve_device, set_seed
+from diffusion_model.util import build_smartfall_bone_adjacency, resolve_device
 
 
 def set_seed_local(seed: int):
@@ -38,22 +38,61 @@ def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
     return x_rs.transpose(1, 2)  # [B,target_len,3]
 
 
-def visualize_skeleton(positions, save_path='skeleton_animation.gif'):
-    # SAME pattern as your example: expects positions [B, T, D]
-    # Your Stage3 outputs [B,T,J,3], so we convert before calling this.
-    connections = [
-        (0, 1),
-        (1, 2), (2, 3), (3, 4),
-        (1, 5), (5, 6), (6, 7),
-        (1, 8), (8, 9),
-        (9, 10), (10, 11), (11, 12),
-        (9, 13), (13, 14), (14, 15)
-    ]
+def _bone_connections(num_joints: int) -> list[tuple[int, int]]:
+    adj = build_smartfall_bone_adjacency(num_joints=num_joints, include_self=False, device=torch.device("cpu"))
+    idx = torch.nonzero(torch.triu(adj, diagonal=1), as_tuple=False)
+    return [(int(i), int(j)) for i, j in idx.tolist()]
+
+
+def warn_if_generation_looks_bad(samples: torch.Tensor, connections: list[tuple[int, int]]) -> None:
+    """
+    Prints warnings when output statistics look degenerate.
+    This cannot prove correctness, but it helps catch bad checkpoints/training mismatch.
+    """
+    if not torch.isfinite(samples).all():
+        print("[WARNING] Non-finite values found in generated skeletons. Check training/checkpoints.")
+        return
+
+    std_all = float(samples.std().item())
+    if std_all < 1e-4:
+        print("[WARNING] Generated skeletons are almost constant. Training may have collapsed.")
+
+    if not connections:
+        return
+
+    edge_idx = torch.tensor(connections, dtype=torch.long)
+    p1 = samples[:, :, edge_idx[:, 0], :]
+    p2 = samples[:, :, edge_idx[:, 1], :]
+    bone_len = (p1 - p2).norm(dim=-1)  # [B,T,E]
+
+    med = float(bone_len.median().item())
+    p95 = float(torch.quantile(bone_len.flatten(), 0.95).item())
+    if med < 1e-4 or p95 > 20.0 * max(med, 1e-6):
+        print(
+            "[WARNING] Bone lengths are highly unstable. This usually means "
+            "training/checkpoint mismatch or poor convergence."
+        )
+
+
+def visualize_skeleton(positions, save_path='skeleton_animation.gif', connections=None):
+    # Expects positions [B,T,J,3]
+    if positions.ndim != 4 or positions.shape[-1] != 3:
+        raise ValueError(f"Expected positions [B,T,J,3], got {tuple(positions.shape)}")
 
     frames = []
     sample_idx = 0
+    _, num_frames, num_joints, _ = positions.shape
+    if connections is None:
+        connections = _bone_connections(num_joints)
 
-    num_frames = positions.shape[1]
+    sample = positions[sample_idx]  # [T,J,3]
+    mins = sample.reshape(-1, 3).min(axis=0)
+    maxs = sample.reshape(-1, 3).max(axis=0)
+    span = np.maximum(maxs - mins, 1e-6)
+    pad = 0.1 * span
+    mins -= pad
+    maxs += pad
+
     for frame_idx in range(num_frames):
         fig = plt.figure(figsize=(8, 8))
         ax = fig.add_subplot(111, projection='3d')
@@ -62,21 +101,25 @@ def visualize_skeleton(positions, save_path='skeleton_animation.gif'):
         ax.grid(False)
         ax.set_axis_off()
 
+        frame_xyz = positions[sample_idx, frame_idx]  # [J,3]
         for joint1, joint2 in connections:
-            joint1_coords = positions[sample_idx, frame_idx, joint1 * 3:(joint1 * 3) + 3]
-            joint2_coords = positions[sample_idx, frame_idx, joint2 * 3:(joint2 * 3) + 3]
-            if len(joint1_coords) < 3 or len(joint2_coords) < 3:
+            if joint1 >= num_joints or joint2 >= num_joints:
                 continue
+            joint1_coords = frame_xyz[joint1]
+            joint2_coords = frame_xyz[joint2]
 
             xs = [joint1_coords[0], joint2_coords[0]]
             ys = [joint1_coords[1], joint2_coords[1]]
             zs = [joint1_coords[2], joint2_coords[2]]
 
-            ax.plot(xs, ys, zs, marker='o', color='darkblue')
-            ax.scatter(joint1_coords[0], joint1_coords[1], joint1_coords[2], color='red', s=50)
-            ax.scatter(joint2_coords[0], joint2_coords[1], joint2_coords[2], color='red', s=50)
+            ax.plot(xs, ys, zs, color='darkblue', linewidth=2.0)
+
+        ax.scatter(frame_xyz[:, 0], frame_xyz[:, 1], frame_xyz[:, 2], color='red', s=25)
 
         ax.set_box_aspect([1, 1, 1])
+        ax.set_xlim(mins[0], maxs[0])
+        ax.set_ylim(mins[1], maxs[1])
+        ax.set_zlim(mins[2], maxs[2])
         ax.view_init(elev=-90, azim=-90)
 
         plt.tight_layout()
@@ -114,8 +157,8 @@ def generate_samples(args, sensor_model, diffusion_model, device):
     from diffusion_model.dataset import SmartFallPairedSlidingWindowDataset, read_csv_files
 
     skeleton_data = read_csv_files(args.skeleton_folder)
-    sensor1_data = read_csv_files(args.sensor_folder1)
-    sensor2_data = read_csv_files(args.sensor_folder2)
+    sensor1_data = read_csv_files(args.right_hip_folder)
+    sensor2_data = read_csv_files(args.left_wrist_folder)
 
     ds_kwargs = dict(
         skeleton_data=skeleton_data,
@@ -129,7 +172,9 @@ def generate_samples(args, sensor_model, diffusion_model, device):
         imu_stats=None,
         imu_eps=args.imu_eps,
         imu_clip=args.imu_clip,
-        sensor_names=("sensor1", "sensor2"),
+        sensor_names=("right_hip", "left_wrist"),
+        sensor_roots=(args.right_hip_folder, args.left_wrist_folder),
+        strict_sensor_identity=True,
     )
     if "align_mode" in inspect.signature(SmartFallPairedSlidingWindowDataset.__init__).parameters:
         ds_kwargs["align_mode"] = args.align_mode
@@ -181,7 +226,7 @@ def generate_samples(args, sensor_model, diffusion_model, device):
 
         # Generate latent using your diffusion model (Stage3Model)
         # This is the equivalent of diffusion_process.generate(...) in your sample
-        adjacency = build_chain_adjacency(num_joints=diffusion_model.num_joints, include_self=True, device=device)
+        adjacency = build_smartfall_bone_adjacency(num_joints=diffusion_model.num_joints, include_self=True, device=device)
 
         batch_n = sensor1.shape[0]
         z0_hat = diffusion_model.sample_latent(
@@ -208,6 +253,12 @@ def main(args):
     set_seed_local(args.seed)
     device = resolve_device(args.device)
 
+    if args.num_joints != 32:
+        print(
+            f"[WARNING] You requested num_joints={args.num_joints}. "
+            "SmartFall skeletons are 32 joints; mismatch can scramble plots."
+        )
+
     # === Load models (same pattern) ===
     sensor_model = SensorTGNNEncoder(
         latent_dim=args.latent_dim,
@@ -231,13 +282,16 @@ def main(args):
     # === Generate samples ===
     print("Generating samples based on sensor inputs...")
     generated_samples = generate_samples(args, sensor_model, diffusion_model, device)
+    if generated_samples.shape[2] != args.num_joints:
+        raise ValueError(
+            f"Generated joints={generated_samples.shape[2]} but args.num_joints={args.num_joints}."
+        )
 
-    # Convert [B,T,J,3] -> [B,T,J*3] to match your visualize_skeleton() exactly
-    B, T, J, D = generated_samples.shape
-    flat = generated_samples.numpy().reshape(B, T, J * D)
+    connections = _bone_connections(args.num_joints)
+    warn_if_generation_looks_bad(generated_samples, connections)
 
     visualize_skeleton(
-        flat,
+        generated_samples.numpy(),
         save_path=args.out_gif
     )
 
@@ -250,11 +304,11 @@ if __name__ == "__main__":
 
     # checkpoints
     parser.add_argument("--stage3_ckpt", type=str, required=True)
-    parser.add_argument("--sensor_ckpt", type=str, default=None)
+    parser.add_argument("--sensor_ckpt", type=str, required=True)
 
     # dataset paths (same style as your sample)
-    parser.add_argument("--sensor_folder1", type=str, required=True)
-    parser.add_argument("--sensor_folder2", type=str, required=True)
+    parser.add_argument("--right_hip_folder", type=str, required=True)
+    parser.add_argument("--left_wrist_folder", type=str, required=True)
     parser.add_argument("--skeleton_folder", type=str, required=True)
 
     # generation params
@@ -272,7 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--drop_misaligned", action="store_true", help="Only used with align_mode=strict")
     parser.set_defaults(drop_misaligned=False)
     parser.add_argument("--fall_activities", type=int, nargs="+", default=[10, 11, 12, 13, 14])
-    parser.add_argument("--imu_norm", type=str, default="none", choices=["none", "zscore"])
+    parser.add_argument("--imu_norm", type=str, default="zscore", choices=["none", "zscore"])
     parser.add_argument("--imu_eps", type=float, default=1e-6)
     parser.add_argument("--imu_clip", type=float, default=6.0)
 
