@@ -254,9 +254,8 @@ def main(args):
     device = resolve_device(args.device)
 
     if args.num_joints != 32:
-        print(
-            f"[WARNING] You requested num_joints={args.num_joints}. "
-            "SmartFall skeletons are 32 joints; mismatch can scramble plots."
+        raise ValueError(
+            f"num_joints must be 32 for SmartFall bone adjacency, got {args.num_joints}."
         )
 
     # === Load models (same pattern) ===
