@@ -36,7 +36,6 @@
   "graph_layers": 3,
   "graph_heads": 8,
   "diffusion_steps": 500,
-  "stage1_mode": "diff",
   "stage1_ckpt": null,
   "imu_hidden_dim": 256,
   "stage3_use_imu": true,

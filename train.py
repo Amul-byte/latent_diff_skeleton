@@ -225,11 +225,18 @@ def make_loaders(
 # ---------------------------
 
 @torch.no_grad()
-def eval_stage1(model: SkeletonStage1Model, loader: DataLoader, adjacency: torch.Tensor, device: torch.device) -> float:
+def eval_stage1(
+    model: SkeletonStage1Model,
+    loader: DataLoader,
+    adjacency: torch.Tensor,
+    device: torch.device,
+    tf: int,
+) -> float:
     model.eval()
     losses = []
     for batch in loader:
         X = batch["X"].to(device, non_blocking=True)  # [B,T,J,3]
+        _assert_tf("X", X, tf)
         out = model.forward_stage1(X, adjacency=adjacency, mode="diff")
         losses.append(out["loss"].detach().float().item())
     return float(sum(losses) / max(1, len(losses)))
@@ -271,6 +278,7 @@ def train_stage1(
 
         for batch in pbar:
             X = batch["X"].to(device, non_blocking=True)
+            _assert_tf("X", X, args.window)
             opt.zero_grad(set_to_none=True)
 
             out = model.forward_stage1(X, adjacency=adjacency, mode="diff")
@@ -282,7 +290,7 @@ def train_stage1(
             running += float(loss.detach().cpu().item())
             pbar.set_postfix(loss=f"{running/max(1,pbar.n):.4f}")
 
-        val_loss = eval_stage1(model, val_loader, adjacency, device)
+        val_loss = eval_stage1(model, val_loader, adjacency, device, tf=args.window)
         logger.info(f"[Stage1/{mode}] epoch={epoch} train_loss={running/max(1,len(train_loader)):.4f} val_loss={val_loss:.4f}")
 
         # Save last
@@ -303,6 +311,15 @@ def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
     return x_rs.transpose(1, 2)  # [B,target_len,3]
 
 
+def _assert_tf(name: str, x: torch.Tensor, tf: int) -> None:
+    """Strict proposal contract: all stage inputs use the same window length Tf."""
+    if x.ndim < 2:
+        raise ValueError(f"{name} must have time axis at dim=1, got shape {tuple(x.shape)}")
+    t = int(x.shape[1])
+    if t != int(tf):
+        raise ValueError(f"{name} time length mismatch: got T={t}, expected Tf={int(tf)}")
+
+
 @torch.no_grad()
 def eval_stage2(
     imu_encoder: SensorTGNNEncoder,
@@ -310,16 +327,20 @@ def eval_stage2(
     loader: DataLoader,
     adjacency: torch.Tensor,
     device: torch.device,
+    tf: int,
 ) -> float:
     imu_encoder.eval()
     stage1.eval()
     losses = []
     for batch in loader:
         X = batch["X"].to(device, non_blocking=True)
+        _assert_tf("X", X, tf)
         A1 = batch["A1"].to(device, non_blocking=True)
         A2 = batch["A2"].to(device, non_blocking=True)
         A1 = _resample_to_len(A1, X.shape[1])
         A2 = _resample_to_len(A2, X.shape[1])
+        _assert_tf("A1", A1, tf)
+        _assert_tf("A2", A2, tf)
 
         z0 = stage1.encoder(X, adjacency)  # frozen
         h_joint, _h_seq = imu_encoder(A1, A2)
@@ -383,10 +404,13 @@ def train_stage2(
 
         for batch in pbar:
             X = batch["X"].to(device, non_blocking=True)
+            _assert_tf("X", X, args.window)
             A1 = batch["A1"].to(device, non_blocking=True)
             A2 = batch["A2"].to(device, non_blocking=True)
             A1 = _resample_to_len(A1, X.shape[1])
             A2 = _resample_to_len(A2, X.shape[1])
+            _assert_tf("A1", A1, args.window)
+            _assert_tf("A2", A2, args.window)
 
             with torch.no_grad():
                 z0 = stage1.encoder(X, adjacency)
@@ -406,7 +430,7 @@ def train_stage2(
             running += float(loss.detach().cpu().item())
             pbar.set_postfix(loss=f"{running/max(1,pbar.n):.4f}")
 
-        val_loss = eval_stage2(imu_encoder, stage1, val_loader, adjacency, device)
+        val_loss = eval_stage2(imu_encoder, stage1, val_loader, adjacency, device, tf=args.window)
         logger.info(f"[Stage2] epoch={epoch} train_loss={running/max(1,len(train_loader)):.4f} val_loss={val_loss:.4f}")
 
         torch.save(
@@ -432,6 +456,7 @@ def eval_stage3(
     adjacency: torch.Tensor,
     device: torch.device,
     use_imu: bool,
+    tf: int,
 ) -> Dict[str, float]:
     stage3.eval()
     stage1.eval()
@@ -446,6 +471,7 @@ def eval_stage3(
 
     for batch in loader:
         X = batch["X"].to(device, non_blocking=True)
+        _assert_tf("X", X, tf)
         y = batch["y"].to(device, non_blocking=True)
 
         with torch.no_grad():
@@ -457,6 +483,8 @@ def eval_stage3(
             A2 = batch["A2"].to(device, non_blocking=True)
             A1 = _resample_to_len(A1, X.shape[1])
             A2 = _resample_to_len(A2, X.shape[1])
+            _assert_tf("A1", A1, tf)
+            _assert_tf("A2", A2, tf)
             h_joint, h_seq = imu_encoder(A1, A2)  # type: ignore[union-attr]
             h = h_joint if stage3_cond_mode(stage3) == "joint" else h_seq
 
@@ -578,6 +606,7 @@ def train_stage3(
 
         for batch in pbar:
             X = batch["X"].to(device, non_blocking=True)
+            _assert_tf("X", X, args.window)
             y = batch["y"].to(device, non_blocking=True)
 
             with torch.no_grad():
@@ -589,6 +618,8 @@ def train_stage3(
                 A2 = batch["A2"].to(device, non_blocking=True)
                 A1 = _resample_to_len(A1, X.shape[1])
                 A2 = _resample_to_len(A2, X.shape[1])
+                _assert_tf("A1", A1, args.window)
+                _assert_tf("A2", A2, args.window)
                 h_joint, h_seq = imu_encoder(A1, A2)  # type: ignore[misc]
                 h = h_joint if cond_mode == "joint" else h_seq
 
@@ -610,7 +641,16 @@ def train_stage3(
             running += float(loss.detach().cpu().item())
             pbar.set_postfix(loss=f"{running/max(1,pbar.n):.4f}")
 
-        metrics = eval_stage3(stage3, stage1, imu_encoder, val_loader, adjacency, device, use_imu=use_imu)
+        metrics = eval_stage3(
+            stage3,
+            stage1,
+            imu_encoder,
+            val_loader,
+            adjacency,
+            device,
+            use_imu=use_imu,
+            tf=args.window,
+        )
         logger.info(
             f"[Stage3] epoch={epoch} train_loss={running/max(1,len(train_loader)):.4f} "
             f"val_loss={metrics['loss']:.4f} val_dloss={metrics['diffusion_loss']:.4f} "

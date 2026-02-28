@@ -38,6 +38,14 @@ def _resample_to_len(x: torch.Tensor, target_len: int) -> torch.Tensor:
     return x_rs.transpose(1, 2)  # [B,target_len,3]
 
 
+def _assert_tf(name: str, x: torch.Tensor, tf: int) -> None:
+    if x.ndim < 2:
+        raise ValueError(f"{name} must have time axis at dim=1, got shape {tuple(x.shape)}")
+    t = int(x.shape[1])
+    if t != int(tf):
+        raise ValueError(f"{name} time length mismatch: got T={t}, expected Tf={int(tf)}")
+
+
 def _bone_connections(num_joints: int) -> list[tuple[int, int]]:
     adj = build_smartfall_bone_adjacency(num_joints=num_joints, include_self=False, device=torch.device("cpu"))
     assert_smartfall_bone_adjacency(adj, include_self=False)
@@ -220,9 +228,12 @@ def generate_samples(args, sensor_model, diffusion_model, device):
         # --- FIX: resample IMU to match window_size (IMU 50Hz vs skeleton 30Hz) ---
         sensor1 = _resample_to_len(sensor1, args.window_size)
         sensor2 = _resample_to_len(sensor2, args.window_size)
+        _assert_tf("sensor1", sensor1, args.window_size)
+        _assert_tf("sensor2", sensor2, args.window_size)
 
         # context (h) from your IMU encoder
         h_joint, _h_seq = sensor_model(sensor1, sensor2)  # h_joint [B,T,J,D]
+        _assert_tf("h_joint", h_joint, args.window_size)
         check_for_nans(h_joint, "context(h_joint)")
 
         # Generate latent using your diffusion model (Stage3Model)
@@ -243,6 +254,7 @@ def generate_samples(args, sensor_model, diffusion_model, device):
 
         # Decode to skeleton coords: [B,T,J,3]
         x_hat = diffusion_model.decode(z0_hat, adjacency)
+        _assert_tf("x_hat", x_hat, args.window_size)
         check_for_nans(x_hat, "generated_sample(x_hat)")
 
         generated_samples.append(x_hat.cpu())
